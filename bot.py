@@ -125,13 +125,20 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
     resp = requests.post(f'{KOMMO_BASE}/leads/complex', headers=headers, json=payload)
     
     if resp.status_code in [200, 201]:
-        result = resp.json()
-        leads = result.get('_embedded', {}).get('leads', [])
-        if leads:
-            lead_id = leads[0].get('id')
-            link = f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/detail/{lead_id}"
+        try:
+            result = resp.json()
+            if isinstance(result, list):
+                lead_id = result[0].get('id') if result else None
+            else:
+                leads = result.get('_embedded', {}).get('leads', [])
+                lead_id = leads[0].get('id') if leads else None
+            if lead_id:
+                link = f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/detail/{lead_id}"
+            else:
+                link = f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/"
             return True, link
-        return True, f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/"
+        except Exception as e:
+            return True, f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/"
     else:
         return False, f"Kommo error {resp.status_code}: {resp.text[:200]}"
 
