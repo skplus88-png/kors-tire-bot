@@ -136,7 +136,7 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
         return False, f"Kommo error {resp.status_code}: {resp.text[:200]}"
 
 def format_response(data: dict, kommo_link: str) -> str:
-    lines = ["✅ *Лид создан в Kommo!*\n"]
+    lines = ["✅ *Lead created in Kommo!*\n"]
     if data.get('name'): lines.append(f"👤 {data['name']}")
     if data.get('phone'): lines.append(f"📞 {data['phone']}")
     if data.get('tire_size'): lines.append(f"🔧 {data['tire_size']}" + (f" {data['brand']}" if data.get('brand') else ""))
@@ -145,11 +145,11 @@ def format_response(data: dict, kommo_link: str) -> str:
     if data.get('status'): lines.append(f"📊 {data['status']}")
     if data.get('appointment'): lines.append(f"📅 {data['appointment']}")
     if data.get('notes'): lines.append(f"📝 {data['notes']}")
-    lines.append(f"\n🔗 [Открыть в Kommo]({kommo_link})")
+    lines.append(f"\n🔗 [Open in Kommo]({kommo_link})")
     return "\n".join(lines)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text("⏳ Читаю фото...")
+    msg = await update.message.reply_text("⏳ Reading photo...")
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
@@ -163,36 +163,36 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if success:
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
         else:
-            await msg.edit_text(f"❌ Данные считал, но ошибка Kommo:\n{link}\n\nДанные: {json.dumps(data, ensure_ascii=False)}")
+            await msg.edit_text(f"❌ Data read, but Kommo error:\n{link}\n\nData: {json.dumps(data, ensure_ascii=False)}")
     except Exception as e:
         logging.error(f"Photo error: {e}", exc_info=True)
-        await msg.edit_text(f"❌ Ошибка: {str(e)}")
+        await msg.edit_text(f"❌ Error: {str(e)}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     if text.startswith('/'):
         return
     
-    msg = await update.message.reply_text("⏳ Обрабатываю...")
+    msg = await update.message.reply_text("⏳ Processing...")
     try:
         data = extract_lead_from_text(text)
         success, link = create_kommo_lead(data)
         if success:
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
         else:
-            await msg.edit_text(f"❌ Ошибка Kommo: {link}")
+            await msg.edit_text(f"❌ Kommo error: {link}")
     except Exception as e:
         logging.error(f"Text error: {e}", exc_info=True)
-        await msg.edit_text(f"❌ Ошибка: {str(e)}")
+        await msg.edit_text(f"❌ Error: {str(e)}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 *Kors Tire Bot*\n\n"
-        "Пришли мне:\n"
-        "📸 Фото стикера — создам лид в Kommo\n"
-        "📱 Скрин с FB Marketplace/Instagram — создам лид\n"
-        "✍️ Текст с данными клиента — создам лид\n\n"
-        "Всё автоматически!",
+        "Send me:\n"
+        "📸 Photo of a lead sticker — I'll create a lead in Kommo\n"
+        "📱 Screenshot from FB Marketplace/Instagram — I'll create a lead\n"
+        "✍️ Text with customer info — I'll create a lead\n\n"
+        "All automatic!",
         parse_mode='Markdown'
     )
 
