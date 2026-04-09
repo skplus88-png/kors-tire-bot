@@ -106,6 +106,7 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
 
     payload = [{
         "name": lead_name,
+        "pipeline_id": 13510819,
         "_embedded": {
             "contacts": [contact]
         }
