@@ -80,6 +80,36 @@ Text: {text}"""
     text_resp = response.content[0].text.strip().replace('```json','').replace('```','').strip()
     return json.loads(text_resp)
 
+BRAND_ENUMS = {
+    "ultraforce": 836269, "wide climber": 836269,
+    "greentrac": 836273, "gt": 836273,
+    "centara": 836277,
+    "zmaxx": 836281,
+    "local": 836283,
+    "suretrac": 836275,
+    "road cruza": 836279,
+}
+
+SOURCE_ENUMS = {
+    "repeat": 836285, "repeat customer": 836285,
+    "facebook": 836287, "facebook marketplace": 836287, "meta": 836287,
+    "referral": 836289, "refferal": 836289,
+    "google": 836291,
+    "castenet": 836293,
+    "walk-in": 836297, "walk in": 836297,
+    "instagram": 836287,
+    "phone": 836299,
+}
+
+TIRE_TYPE_ENUMS = {
+    "winter": 836261,
+    "all season": 836263, "as": 836263,
+    "summer": 836591,
+    "all-weather": 836595, "aw": 836595, "all weather": 836595,
+    "lt": 836265, "lt truck": 836265,
+    "quad": 836593, "atv": 836593,
+}
+
 def create_kommo_lead(data: dict) -> tuple[bool, str]:
     name = data.get('name') or 'Unknown'
     tire_size = data.get('tire_size', '')
@@ -96,9 +126,48 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
             "values": [{"value": data['phone'], "enum_code": "WORK"}]
         }]
 
+    # Build custom fields
+    custom_fields = []
+
+    # Size field (text)
+    if tire_size:
+        custom_fields.append({"field_id": 983549, "values": [{"value": tire_size}]})
+
+    # Tire Brand (multiselect)
+    if brand:
+        brand_lower = brand.lower()
+        brand_enum = None
+        for key, enum_id in BRAND_ENUMS.items():
+            if key in brand_lower:
+                brand_enum = enum_id
+                break
+        if brand_enum:
+            custom_fields.append({"field_id": 983835, "values": [{"enum_id": brand_enum}]})
+
+    # Source (multiselect) - from channel and customer_type
+    source_enums = []
+    channel = (data.get('channel') or '').lower()
+    customer_type = (data.get('customer_type') or '').lower()
+    if 'repeat' in customer_type:
+        source_enums.append({"enum_id": 836285})
+    for key, enum_id in SOURCE_ENUMS.items():
+        if key in channel and enum_id != 836285:
+            source_enums.append({"enum_id": enum_id})
+            break
+    if source_enums:
+        custom_fields.append({"field_id": 983837, "values": source_enums})
+
+    # Tire Type (multiselect) - detect from brand name or notes
+    brand_and_notes = f"{brand} {data.get('notes') or ''}".lower()
+    tire_type_enum = None
+    for key, enum_id in TIRE_TYPE_ENUMS.items():
+        if key in brand_and_notes:
+            tire_type_enum = enum_id
+            break
+    if tire_type_enum:
+        custom_fields.append({"field_id": 983831, "values": [{"enum_id": tire_type_enum}]})
+
     notes_parts = []
-    if data.get('channel'): notes_parts.append(f"Channel: {data['channel']}")
-    if data.get('customer_type'): notes_parts.append(f"Customer type: {data['customer_type']}")
     if data.get('appointment'): notes_parts.append(f"Appointment: {data['appointment']}")
     if data.get('notes'): notes_parts.append(f"Notes: {data['notes']}")
     if data.get('status'): notes_parts.append(f"Status: {data['status']}")
@@ -107,6 +176,7 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
     payload = [{
         "name": lead_name,
         "pipeline_id": 13510819,
+        "custom_fields_values": custom_fields if custom_fields else None,
         "_embedded": {
             "contacts": [contact]
         }
