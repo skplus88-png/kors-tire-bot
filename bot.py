@@ -306,8 +306,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success, link, lead_id = create_kommo_lead(data)
 
         if success:
+            logging.info(f"Lead created. lead_id={lead_id}, link={link}")
             if lead_id:
                 attach_photo_to_lead(lead_id, image_data, "sticker.jpg")
+            else:
+                logging.error("lead_id is None, cannot attach photo")
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
         else:
             await msg.edit_text(f"❌ Data read, but Kommo error:\n{link}\n\nData: {json.dumps(data, ensure_ascii=False)}")
