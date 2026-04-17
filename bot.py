@@ -229,24 +229,54 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
     else:
         return False, f"Kommo error {resp.status_code}: {resp.text[:200]}", None
 
-def attach_photo_to_lead(lead_id: int, file_url: str):
+def attach_photo_to_lead(lead_id: int, image_data: bytes, filename: str = "sticker.jpg"):
     try:
-        headers = {
-            'Authorization': f'Bearer {KOMMO_TOKEN}',
-            'Content-Type': 'application/json'
-        }
-        note_payload = [{
-            "entity_id": lead_id,
-            "note_type": "common",
-            "params": {"text": f"📸 Original sticker photo:\n{file_url}"}
-        }]
-        requests.post(
-            f'{KOMMO_BASE}/leads/{lead_id}/notes',
+        headers = {'Authorization': f'Bearer {KOMMO_TOKEN}'}
+
+        # Step 1: Upload file to Kommo Drive
+        upload_resp = requests.post(
+            f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4/files',
             headers=headers,
-            json=note_payload
+            files={'file': (filename, image_data, 'image/jpeg')}
         )
+        logging.info(f"Kommo file upload: {upload_resp.status_code} | {upload_resp.text[:300]}")
+
+        file_uuid = None
+        version_uuid = None
+
+        if upload_resp.status_code in [200, 201]:
+            result = upload_resp.json()
+            files_list = []
+            if isinstance(result, list):
+                files_list = result
+            elif '_embedded' in result:
+                files_list = result['_embedded'].get('files', [])
+            
+            if files_list:
+                file_uuid = files_list[0].get('uuid')
+                version_uuid = files_list[0].get('version_uuid', file_uuid)
+
+        if file_uuid:
+            # Step 2: Attach to lead as note
+            note_payload = [{
+                "entity_id": lead_id,
+                "note_type": "attachment",
+                "params": {
+                    "file_uuid": file_uuid,
+                    "version_uuid": version_uuid or file_uuid
+                }
+            }]
+            note_resp = requests.post(
+                f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4/leads/{lead_id}/notes',
+                headers={**headers, 'Content-Type': 'application/json'},
+                json=note_payload
+            )
+            logging.info(f"Kommo note attach: {note_resp.status_code} | {note_resp.text[:300]}")
+        else:
+            logging.error(f"No file_uuid received from Kommo. Upload status: {upload_resp.status_code}")
+
     except Exception as e:
-        logging.error(f"Photo attach error: {e}")
+        logging.error(f"Photo attach error: {e}", exc_info=True)
 
 def format_response(data: dict, kommo_link: str) -> str:
     lines = ["✅ *Lead created in Kommo!*\n"]
@@ -274,9 +304,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         success, link, lead_id = create_kommo_lead(data)
 
         if success:
-            if lead_id and file.file_path:
-                file_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file.file_path}"
-                attach_photo_to_lead(lead_id, file_url)
+            if lead_id:
+                attach_photo_to_lead(lead_id, image_data, "sticker.jpg")
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
         else:
             await msg.edit_text(f"❌ Data read, but Kommo error:\n{link}\n\nData: {json.dumps(data, ensure_ascii=False)}")
