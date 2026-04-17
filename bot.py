@@ -235,7 +235,7 @@ def attach_photo_to_lead(lead_id: int, image_data: bytes, filename: str = "stick
 
         # Step 1: Upload file to Kommo Drive
         upload_resp = requests.post(
-            f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4/files',
+            'https://drive-b.kommo.com/v1.0/files',
             headers=headers,
             files={'file': (filename, image_data, 'image/jpeg')}
         )
@@ -251,7 +251,9 @@ def attach_photo_to_lead(lead_id: int, image_data: bytes, filename: str = "stick
                 files_list = result
             elif '_embedded' in result:
                 files_list = result['_embedded'].get('files', [])
-            
+            elif 'uuid' in result:
+                files_list = [result]
+
             if files_list:
                 file_uuid = files_list[0].get('uuid')
                 version_uuid = files_list[0].get('version_uuid', file_uuid)
@@ -273,7 +275,7 @@ def attach_photo_to_lead(lead_id: int, image_data: bytes, filename: str = "stick
             )
             logging.info(f"Kommo note attach: {note_resp.status_code} | {note_resp.text[:300]}")
         else:
-            logging.error(f"No file_uuid received from Kommo. Upload status: {upload_resp.status_code}")
+            logging.error(f"No file_uuid received. Upload status: {upload_resp.status_code} | {upload_resp.text[:200]}")
 
     except Exception as e:
         logging.error(f"Photo attach error: {e}", exc_info=True)
