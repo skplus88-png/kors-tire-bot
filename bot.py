@@ -232,21 +232,52 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
 def attach_photo_to_lead(lead_id: int, image_data: bytes, filename: str = "sticker.jpg"):
     try:
         headers = {'Authorization': f'Bearer {KOMMO_TOKEN}'}
+        
+        # Step 1: Upload file to Kommo
         files = {'file': (filename, image_data, 'image/jpeg')}
-        resp = requests.post(
-            f'{KOMMO_BASE}/leads/{lead_id}/files',
+        upload_resp = requests.post(
+            f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4/files',
             headers=headers,
             files=files
         )
-        if resp.status_code not in [200, 201]:
-            # Try uploading as note with attachment
-            note_payload = {
+        
+        if upload_resp.status_code in [200, 201]:
+            file_data = upload_resp.json()
+            file_uuid = None
+            if isinstance(file_data, list) and file_data:
+                file_uuid = file_data[0].get('uuid')
+            elif isinstance(file_data, dict):
+                items = file_data.get('_embedded', {}).get('files', [])
+                if items:
+                    file_uuid = items[0].get('uuid')
+            
+            if file_uuid:
+                # Step 2: Attach file to lead as note
+                note_payload = [{
+                    "entity_id": lead_id,
+                    "note_type": "file",
+                    "params": {
+                        "file_uuid": file_uuid,
+                        "file_name": filename
+                    }
+                }]
+                requests.post(
+                    f'{KOMMO_BASE}/leads/{lead_id}/notes',
+                    headers={**headers, 'Content-Type': 'application/json'},
+                    json=note_payload
+                )
+        else:
+            # Fallback: attach as common note with text
+            note_payload = [{
                 "entity_id": lead_id,
-                "entity_type": "leads",
-                "note_type": "attachment",
-                "params": {"file_name": filename}
-            }
-            requests.post(f'{KOMMO_BASE}/leads/{lead_id}/notes', headers={**headers, 'Content-Type': 'application/json'}, json=[note_payload])
+                "note_type": "common",
+                "params": {"text": "📎 Original sticker photo sent via Telegram bot"}
+            }]
+            requests.post(
+                f'{KOMMO_BASE}/leads/{lead_id}/notes',
+                headers={**headers, 'Content-Type': 'application/json'},
+                json=note_payload
+            )
     except Exception as e:
         logging.error(f"Photo attach error: {e}")
 
