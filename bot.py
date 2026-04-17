@@ -229,54 +229,30 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
     else:
         return False, f"Kommo error {resp.status_code}: {resp.text[:200]}", None
 
-def attach_photo_to_lead(lead_id: int, image_data: bytes, filename: str = "sticker.jpg"):
+def attach_photo_to_lead(lead_id: int, image_data: bytes, filename: str = "sticker.jpg", file_path: str = None):
     try:
-        headers = {'Authorization': f'Bearer {KOMMO_TOKEN}'}
-
-        # Step 1: Upload file to Kommo Drive
-        upload_resp = requests.post(
-            'https://drive-b.kommo.com/v1.0/files',
-            headers=headers,
-            files={'file': (filename, image_data, 'image/jpeg')}
-        )
-        logging.info(f"Kommo file upload: {upload_resp.status_code} | {upload_resp.text[:300]}")
-
-        file_uuid = None
-        version_uuid = None
-
-        if upload_resp.status_code in [200, 201]:
-            result = upload_resp.json()
-            files_list = []
-            if isinstance(result, list):
-                files_list = result
-            elif '_embedded' in result:
-                files_list = result['_embedded'].get('files', [])
-            elif 'uuid' in result:
-                files_list = [result]
-
-            if files_list:
-                file_uuid = files_list[0].get('uuid')
-                version_uuid = files_list[0].get('version_uuid', file_uuid)
-
-        if file_uuid:
-            # Step 2: Attach to lead as note
-            note_payload = [{
-                "entity_id": lead_id,
-                "note_type": "attachment",
-                "params": {
-                    "file_uuid": file_uuid,
-                    "version_uuid": version_uuid or file_uuid
-                }
-            }]
-            note_resp = requests.post(
-                f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4/leads/{lead_id}/notes',
-                headers={**headers, 'Content-Type': 'application/json'},
-                json=note_payload
-            )
-            logging.info(f"Kommo note attach: {note_resp.status_code} | {note_resp.text[:300]}")
+        headers = {
+            'Authorization': f'Bearer {KOMMO_TOKEN}',
+            'Content-Type': 'application/json'
+        }
+        
+        if file_path:
+            photo_url = f"https://api.telegram.org/file/bot{TELEGRAM_TOKEN}/{file_path}"
+            note_text = f"📸 Original sticker: {photo_url}"
         else:
-            logging.error(f"No file_uuid received. Upload status: {upload_resp.status_code} | {upload_resp.text[:200]}")
+            note_text = "📸 Original sticker photo (see Telegram)"
 
+        note_payload = [{
+            "entity_id": lead_id,
+            "note_type": "common",
+            "params": {"text": note_text}
+        }]
+        note_resp = requests.post(
+            f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4/leads/{lead_id}/notes',
+            headers=headers,
+            json=note_payload
+        )
+        logging.info(f"Kommo note: {note_resp.status_code} | {note_resp.text[:200]}")
     except Exception as e:
         logging.error(f"Photo attach error: {e}", exc_info=True)
 
@@ -308,7 +284,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if success:
             logging.info(f"Lead created. lead_id={lead_id}, link={link}")
             if lead_id:
-                attach_photo_to_lead(lead_id, image_data, "sticker.jpg")
+                attach_photo_to_lead(lead_id, image_data, "sticker.jpg", file.file_path)
             else:
                 logging.error("lead_id is None, cannot attach photo")
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
