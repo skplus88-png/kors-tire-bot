@@ -33,7 +33,7 @@ def extract_lead_from_image(image_data: bytes) -> dict:
                 {
                     "type": "text",
                     "text": """This is a photo from a tire shop employee. It's either:
-- A handwritten pink lead sticker with customer info
+- A handwritten lead sticker with customer info (pink = Kelowna location, yellow = Vernon location)
 - A screenshot from Facebook Marketplace, Instagram, or other messaging channel
 
 Extract ALL visible information. Return ONLY valid JSON, no markdown, no extra text:
@@ -42,11 +42,12 @@ Extract ALL visible information. Return ONLY valid JSON, no markdown, no extra t
   "phone": "phone number or null",
   "tire_size": "tire size like 225/65R17 or null",
   "brand": "tire brand and model or null",
-  "channel": "one of: Phone, Walk-in, Facebook Marketplace, Facebook, Instagram, Referral, Google, Email, or null",
+  "channel": "one of: Phone, Walk-in, Facebook Marketplace, Facebook, Instagram, Referral, Google, Email, or null. If you see 'FB' written on the sticker, use 'Facebook'",
   "customer_type": "New or Repeat or null",
   "status": "one of: Booked, Will Call Back, Will Come In, Follow Up, Lost, Changeover, or null",
   "appointment": "appointment date and time if mentioned or null",
-  "notes": "any other relevant info or null"
+  "notes": "any other relevant info or null",
+  "sticker_color": "pink or yellow or null - based on the physical color of the sticker paper. Pink = Kelowna, Yellow = Vernon"
 }"""
                 }
             ]
@@ -167,6 +168,20 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
     if tire_type_enum:
         custom_fields.append({"field_id": 983831, "values": [{"enum_id": tire_type_enum}]})
 
+    # Tags based on sticker color (location)
+    tags = []
+    sticker_color = (data.get('sticker_color') or '').lower()
+    location_enum = None
+    if sticker_color == 'pink':
+        tags.append({"name": "HC"})
+        location_enum = 836301  # Kelowna
+    elif sticker_color == 'yellow':
+        tags.append({"name": "VN"})
+        location_enum = 836303  # Vernon
+
+    if location_enum:
+        custom_fields.append({"field_id": 983839, "values": [{"enum_id": location_enum}]})
+
     notes_parts = []
     if data.get('appointment'): notes_parts.append(f"Appointment: {data['appointment']}")
     if data.get('notes'): notes_parts.append(f"Notes: {data['notes']}")
@@ -178,7 +193,8 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
         "pipeline_id": 13510819,
         "custom_fields_values": custom_fields if custom_fields else None,
         "_embedded": {
-            "contacts": [contact]
+            "contacts": [contact],
+            "tags": tags if tags else []
         }
     }]
     
@@ -207,11 +223,32 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
                 link = f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/detail/{lead_id}"
             else:
                 link = f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/"
-            return True, link
+            return True, link, lead_id
         except Exception as e:
-            return True, f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/"
+            return True, f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/", None
     else:
-        return False, f"Kommo error {resp.status_code}: {resp.text[:200]}"
+        return False, f"Kommo error {resp.status_code}: {resp.text[:200]}", None
+
+def attach_photo_to_lead(lead_id: int, image_data: bytes, filename: str = "sticker.jpg"):
+    try:
+        headers = {'Authorization': f'Bearer {KOMMO_TOKEN}'}
+        files = {'file': (filename, image_data, 'image/jpeg')}
+        resp = requests.post(
+            f'{KOMMO_BASE}/leads/{lead_id}/files',
+            headers=headers,
+            files=files
+        )
+        if resp.status_code not in [200, 201]:
+            # Try uploading as note with attachment
+            note_payload = {
+                "entity_id": lead_id,
+                "entity_type": "leads",
+                "note_type": "attachment",
+                "params": {"file_name": filename}
+            }
+            requests.post(f'{KOMMO_BASE}/leads/{lead_id}/notes', headers={**headers, 'Content-Type': 'application/json'}, json=[note_payload])
+    except Exception as e:
+        logging.error(f"Photo attach error: {e}")
 
 def format_response(data: dict, kommo_link: str) -> str:
     lines = ["✅ *Lead created in Kommo!*\n"]
@@ -236,9 +273,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         image_data = buf.getvalue()
 
         data = extract_lead_from_image(image_data)
-        success, link = create_kommo_lead(data)
+        success, link, lead_id = create_kommo_lead(data)
 
         if success:
+            if lead_id:
+                attach_photo_to_lead(lead_id, image_data, "sticker.jpg")
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
         else:
             await msg.edit_text(f"❌ Data read, but Kommo error:\n{link}\n\nData: {json.dumps(data, ensure_ascii=False)}")
@@ -254,7 +293,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Processing...")
     try:
         data = extract_lead_from_text(text)
-        success, link = create_kommo_lead(data)
+        success, link, lead_id = create_kommo_lead(data)
         if success:
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
         else:
