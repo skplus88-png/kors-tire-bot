@@ -17,11 +17,12 @@ KOMMO_SUBDOMAIN = 'korstire'
 KOMMO_BASE = f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4'
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+CLAUDE_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-5')
 
 def extract_lead_from_image(image_data: bytes) -> dict:
     b64 = base64.standard_b64encode(image_data).decode('utf-8')
     response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=CLAUDE_MODEL,
         max_tokens=800,
         messages=[{
             "role": "user",
@@ -58,7 +59,7 @@ Extract ALL visible information. Return ONLY valid JSON, no markdown, no extra t
 
 def extract_lead_from_text(text: str) -> dict:
     response = claude.messages.create(
-        model="claude-sonnet-4-20250514",
+        model=CLAUDE_MODEL,
         max_tokens=800,
         messages=[{
             "role": "user",
