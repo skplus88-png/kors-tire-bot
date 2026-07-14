@@ -18,6 +18,29 @@ KOMMO_BASE = f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4'
 
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 CLAUDE_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-5')
+ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID')
+
+async def notify_admin(context: ContextTypes.DEFAULT_TYPE, update: Update, error_text: str):
+    """Send a private alert to the owner whenever the bot fails to create a lead."""
+    if not ADMIN_CHAT_ID:
+        logging.warning("ADMIN_CHAT_ID not set — admin alert skipped")
+        return
+    try:
+        user = update.effective_user
+        who = f"@{user.username}" if user and user.username else (user.full_name if user else "unknown")
+        chat_link = ""
+        if update.effective_chat and update.effective_message:
+            chat_link = f"\nMessage: chat {update.effective_chat.id}, msg {update.effective_message.message_id}"
+        alert = (
+            "🚨 KORS TIRE BOT — LEAD NOT CREATED\n\n"
+            f"From: {who}"
+            f"{chat_link}\n\n"
+            f"Error:\n{error_text[:600]}\n\n"
+            "The lead was NOT saved to Kommo. Recover it manually."
+        )
+        await context.bot.send_message(chat_id=ADMIN_CHAT_ID, text=alert)
+    except Exception as e:
+        logging.error(f"Admin notify failed: {e}", exc_info=True)
 
 def extract_lead_from_image(image_data: bytes) -> dict:
     b64 = base64.standard_b64encode(image_data).decode('utf-8')
@@ -291,9 +314,11 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
         else:
             await msg.edit_text(f"❌ Data read, but Kommo error:\n{link}\n\nData: {json.dumps(data, ensure_ascii=False)}")
+            await notify_admin(context, update, f"Photo lead — Kommo rejected it.\n{link}\n\nExtracted: {json.dumps(data, ensure_ascii=False)}")
     except Exception as e:
         logging.error(f"Photo error: {e}", exc_info=True)
         await msg.edit_text(f"❌ Error: {str(e)}")
+        await notify_admin(context, update, f"Photo lead failed.\n{type(e).__name__}: {str(e)}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
@@ -308,9 +333,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await msg.edit_text(format_response(data, link), parse_mode='Markdown')
         else:
             await msg.edit_text(f"❌ Kommo error: {link}")
+            await notify_admin(context, update, f"Text lead — Kommo rejected it.\n{link}\n\nOriginal text: {text[:300]}")
     except Exception as e:
         logging.error(f"Text error: {e}", exc_info=True)
         await msg.edit_text(f"❌ Error: {str(e)}")
+        await notify_admin(context, update, f"Text lead failed.\n{type(e).__name__}: {str(e)}\n\nOriginal text: {text[:300]}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -323,12 +350,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode='Markdown'
     )
 
+async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Chat ID: `{update.effective_chat.id}`", parse_mode='Markdown')
+
+async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Verify the Claude API is reachable and the configured model still exists."""
+    try:
+        claude.messages.create(
+            model=CLAUDE_MODEL,
+            max_tokens=10,
+            messages=[{"role": "user", "content": "ping"}]
+        )
+        await update.message.reply_text(f"✅ Claude OK — model: {CLAUDE_MODEL}")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Claude FAILED — model: {CLAUDE_MODEL}\n{type(e).__name__}: {str(e)[:300]}")
+
 def main():
     app = Application.builder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("id", chat_id))
+    app.add_handler(CommandHandler("health", health))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
-    logging.info("Bot started!")
+    logging.info(f"Bot started! Model: {CLAUDE_MODEL} | Admin alerts: {'ON' if ADMIN_CHAT_ID else 'OFF'}")
     app.run_polling(drop_pending_updates=True)
 
 if __name__ == '__main__':
