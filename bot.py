@@ -20,6 +20,27 @@ claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 CLAUDE_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-5')
 ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID')
 
+def parse_claude_json(response) -> dict:
+    """Pull the JSON out of a Claude response.
+
+    The response can contain several content blocks and the first one is not
+    always the text block, so never index into content[0] blindly.
+    """
+    chunks = []
+    for block in response.content:
+        if getattr(block, 'type', None) == 'text' and getattr(block, 'text', None):
+            chunks.append(block.text)
+    raw = "".join(chunks).strip()
+    if not raw:
+        raise ValueError(f"Claude returned no text block. Blocks: {[getattr(b, 'type', '?') for b in response.content]}")
+    raw = raw.replace('```json', '').replace('```', '').strip()
+    # If the model wrapped the JSON in a sentence, cut everything outside the braces
+    if not raw.startswith('{'):
+        start, end = raw.find('{'), raw.rfind('}')
+        if start != -1 and end != -1:
+            raw = raw[start:end + 1]
+    return json.loads(raw)
+
 async def notify_admin(context: ContextTypes.DEFAULT_TYPE, update: Update, error_text: str):
     """Send a private alert to the owner whenever the bot fails to create a lead."""
     if not ADMIN_CHAT_ID:
@@ -77,8 +98,7 @@ Extract ALL visible information. Return ONLY valid JSON, no markdown, no extra t
             ]
         }]
     )
-    text = response.content[0].text.strip().replace('```json','').replace('```','').strip()
-    return json.loads(text)
+    return parse_claude_json(response)
 
 def extract_lead_from_text(text: str) -> dict:
     response = claude.messages.create(
@@ -102,8 +122,7 @@ def extract_lead_from_text(text: str) -> dict:
 Text: {text}"""
         }]
     )
-    text_resp = response.content[0].text.strip().replace('```json','').replace('```','').strip()
-    return json.loads(text_resp)
+    return parse_claude_json(response)
 
 BRAND_ENUMS = {
     "ultraforce": 836269, "wide climber": 836269,
@@ -354,14 +373,15 @@ async def chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"Chat ID: `{update.effective_chat.id}`", parse_mode='Markdown')
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Verify the Claude API is reachable and the configured model still exists."""
+    """Verify the Claude API is reachable, the model exists, and the response parses."""
     try:
-        claude.messages.create(
+        response = claude.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=10,
-            messages=[{"role": "user", "content": "ping"}]
+            max_tokens=100,
+            messages=[{"role": "user", "content": 'Return ONLY this JSON, nothing else: {"ok": true}'}]
         )
-        await update.message.reply_text(f"✅ Claude OK — model: {CLAUDE_MODEL}")
+        parsed = parse_claude_json(response)
+        await update.message.reply_text(f"✅ Claude OK — model: {CLAUDE_MODEL} | parse: {parsed}")
     except Exception as e:
         await update.message.reply_text(f"❌ Claude FAILED — model: {CLAUDE_MODEL}\n{type(e).__name__}: {str(e)[:300]}")
 
