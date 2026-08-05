@@ -233,7 +233,7 @@ def create_kommo_lead(data: dict) -> tuple[bool, str]:
 
     payload = [{
         "name": lead_name,
-        "pipeline_id": 13510819,
+        "pipeline_id": 11129295,
         "custom_fields_values": custom_fields if custom_fields else None,
         "_embedded": {
             "contacts": [contact],
