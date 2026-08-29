@@ -159,26 +159,38 @@ The printed layout, so you know where to look:
 - HEARD OF US: five tick boxes - Google, Castanet, Facebook, referral,
   been here before.
 
+Answer in two steps, both inside the JSON.
+
+STEP 1 - evidence. Before deciding anything, write down what you actually see:
+
+  "phone_boxes": one entry per box, left to right, ten of them. Each entry is
+    the single digit written in that box, or null if the box is empty. Do not
+    write the number as a whole - go box by box, and count the boxes as you go.
+
+  "ticked": the list of tick boxes that have ink in them. Use these names and
+    no others: in_stock, out_of_stock, local_offer, ours_with_installation,
+    local_with_installation, booked, google, castanet, facebook, referral,
+    been_here_before. A box goes in this list ONLY if you can see a pen stroke
+    inside the square. If the list is empty, return []. Do not add a box
+    because the card would "make sense" with it ticked.
+
+STEP 2 - the rest.
+
 Return ONLY valid JSON, no markdown fence, no commentary:
 
 {
-  "phone": "ten digits with no punctuation, or null",
+  "phone_boxes": ["2","5","0","5","7","1","4","6","5","4"],
+  "ticked": ["out_of_stock", "local_offer", "booked", "facebook"],
   "name": "as written, or null",
   "vehicle": "as written, or null",
   "size": "as written with its separators, e.g. 275/60R20, or null",
-  "stock_in": true or false,
-  "stock_out": true or false,
-  "stock_local": true or false,
   "price_ours": whole number or null,
-  "price_ours_install": true or false,
   "price_local": whole number or null,
-  "price_local_install": true or false,
-  "booked": true or false,
-  "heard": "google" or "castanet" or "facebook" or "referral" or "repeat" or null,
   "unreadable": ["names of fields you could not read confidently"]
 }
 
-"repeat" is the box printed "been here before"."""
+The two examples above are the shape, not the answer. Read the card in front
+of you."""
 
 TEXT_PROMPT = """The following is a correction typed by a KORS Tire rep for a
 call card that was just read from a photograph. Return ONLY the fields the rep
@@ -191,6 +203,56 @@ Do not invent fields the rep did not mention.
 
 Rep's message:
 """
+
+
+TICK_NAMES = ("in_stock", "out_of_stock", "local_offer",
+              "ours_with_installation", "local_with_installation", "booked",
+              "google", "castanet", "facebook", "referral", "been_here_before")
+
+HEARD_FROM_TICK = {"google": "google", "castanet": "castanet",
+                   "facebook": "facebook", "referral": "referral",
+                   "been_here_before": "repeat"}
+
+
+def normalise_card(raw: dict) -> dict:
+    """Turn the model's evidence into the flat card the rest of the code uses.
+
+    The model is asked for what it SEES - a digit per box, a list of boxes with
+    ink in them - and the booleans are worked out here. 29 August: asked for
+    booleans directly, it twice reported "with installation" as ticked on a
+    card where both squares were bare. Listing what has ink is a smaller thing
+    to get wrong than filling in eleven true/false answers.
+    """
+    ticked = {t for t in (raw.get('ticked') or []) if t in TICK_NAMES}
+
+    boxes = raw.get('phone_boxes')
+    if isinstance(boxes, list):
+        phone = ''.join(re.sub(r'\D', '', str(b or '')) for b in boxes)
+    else:
+        phone = digits(raw.get('phone'))
+
+    heard = None
+    for key, value in HEARD_FROM_TICK.items():
+        if key in ticked:
+            heard = value
+            break
+
+    return {
+        'phone': phone,
+        'name': raw.get('name'),
+        'vehicle': raw.get('vehicle'),
+        'size': raw.get('size'),
+        'stock_in': 'in_stock' in ticked,
+        'stock_out': 'out_of_stock' in ticked,
+        'stock_local': 'local_offer' in ticked,
+        'price_ours': raw.get('price_ours'),
+        'price_ours_install': 'ours_with_installation' in ticked,
+        'price_local': raw.get('price_local'),
+        'price_local_install': 'local_with_installation' in ticked,
+        'booked': 'booked' in ticked,
+        'heard': heard,
+        'unreadable': raw.get('unreadable') or [],
+    }
 
 
 def parse_claude_json(response) -> dict:
@@ -235,7 +297,7 @@ def read_card(image_data: bytes) -> dict:
             ],
         }],
     )
-    return parse_claude_json(response)
+    return normalise_card(parse_claude_json(response))
 
 
 def read_correction(text: str) -> dict:
@@ -263,22 +325,24 @@ def fmt_phone(value) -> str:
 
 
 def phone_in_call_log(phone: str):
-    """Was there a call to or from this number in the last few days?
+    """Look the number up in the call log, and if it is not there, look for a
+    number that is ALMOST it.
 
-    Returns True, False, or None when the check could not run at all. None is
-    not "no" - it must never be shown to the rep as a warning, or he learns to
-    ignore warnings.
+    Returns (found, near) where found is True / False / None (check could not
+    run), and near is the list of real numbers from the log that differ from
+    the card by one or two digits.
 
-    This is a check on the DIGITS, not on the customer. It catches a misread
-    box, which is the one failure the rep cannot spot by rereading his own
-    handwriting: the number looks right to him because he wrote it.
+    The near list is the point. 29 August the model read 250 571-4654 as
+    260 571-4654 - one digit. Saying "no such number" leaves the rep hunting;
+    saying "there was a call from 250 571-4654 today, one digit out" hands him
+    the answer, and it is a fact from the log, not another guess.
     """
     if not AIRTABLE_TOKEN:
-        return None
+        return None, []
     want = digits(phone)[-10:]
     if len(want) < 10:
-        return None
-    since = (datetime.datetime.utcnow()
+        return None, []
+    since = (datetime.datetime.now(datetime.timezone.utc)
              - datetime.timedelta(days=CALL_LOOKBACK_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
     url = f'https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_CALLS}'
     params = [('pageSize', 100),
@@ -287,7 +351,7 @@ def phone_in_call_log(phone: str):
               ('filterByFormula',
                "IS_AFTER({Date/Time}, DATETIME_PARSE('%s'))" % since)]
     headers = {'Authorization': f'Bearer {AIRTABLE_TOKEN}'}
-    offset = None
+    seen, offset = set(), None
     try:
         for _ in range(20):
             p = list(params)
@@ -296,19 +360,29 @@ def phone_in_call_log(phone: str):
             r = requests.get(url, headers=headers, params=p, timeout=25)
             if r.status_code != 200:
                 log.error("Airtable %s: %s", r.status_code, r.text[:200])
-                return None
+                return None, []
             body = r.json()
             for rec in body.get('records', []):
-                value = rec.get('fields', {}).get(CALL_PHONE_FIELD)
-                if digits(value)[-10:] == want:
-                    return True
+                d = digits(rec.get('fields', {}).get(CALL_PHONE_FIELD))[-10:]
+                if len(d) == 10:
+                    seen.add(d)
             offset = body.get('offset')
             if not offset:
                 break
-        return False
     except Exception as exc:
         log.error("Call-log check failed: %s", exc)
-        return None
+        return None, []
+
+    if want in seen:
+        return True, []
+
+    near = []
+    for d in seen:
+        wrong = sum(1 for a, b in zip(d, want) if a != b)
+        if wrong <= 2:
+            near.append(d)
+    near.sort(key=lambda d: sum(1 for a, b in zip(d, want) if a != b))
+    return False, near[:3]
 
 
 def contacts_by_name(name: str):
@@ -412,9 +486,16 @@ def confirmation_text(data: dict, store: str, call_check=None,
     # not run, and a warning that fires when nothing is known is a warning
     # nobody reads.
     notes = []
-    if call_check is False:
-        notes.append(f"no call to this number in the last {CALL_LOOKBACK_DAYS} "
-                     f"days — fine if he walked in")
+    found, near = (call_check if isinstance(call_check, tuple)
+                   else (call_check, []))
+    if found is False:
+        if near:
+            spelled = ", ".join(f"<b>{e(fmt_phone(n))}</b>" for n in near)
+            notes.append(f"no call from this number, but there was one from "
+                         f"{spelled} — one or two digits out. Check the boxes.")
+        else:
+            notes.append(f"no call to this number in the last "
+                         f"{CALL_LOOKBACK_DAYS} days — fine if he walked in")
     want = digits(data.get('phone'))[-10:]
     for got_name, got_phone in (name_matches or []):
         if got_phone and digits(got_phone)[-10:] != want:
@@ -882,8 +963,8 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not AIRTABLE_TOKEN:
         lines.append("⚠️ Call-log check OFF — AIRTABLE_TOKEN not set")
     else:
-        probe = phone_in_call_log('0000000000')
-        lines.append("✅ Call log reachable" if probe is False
+        found, _ = phone_in_call_log('0000000000')
+        lines.append("✅ Call log reachable" if found is False
                      else "❌ Call log NOT reachable")
     lines.append(f"Stores mapped: {len(STORE_BY_USER)}")
     await update.message.reply_text("\n".join(lines))
