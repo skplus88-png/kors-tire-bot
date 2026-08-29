@@ -24,6 +24,7 @@ import os
 import io
 import re
 import json
+import html
 import base64
 import logging
 import datetime
@@ -365,34 +366,43 @@ def confirmation_text(data: dict, store: str, call_check=None,
                       name_matches=None) -> str:
     """What the rep reads before anything is written.
 
+    Built as HTML with every value escaped, NOT as Markdown. 29 August: a card
+    read fine and then Telegram refused the message with "can\'t find end of
+    the entity" - an asterisk or underscore inside a handwritten name is enough
+    to break Markdown, and then the whole card is lost over a punctuation mark.
+    HTML plus html.escape() cannot be broken by anything the pen writes.
+
     Handwritten fields are bold, because those are the only ones a machine can
     misread. Ticks are plain: a box is either marked or it is not.
     """
-    def b(v):
-        return f"*{v}*" if v else "—"
+    def e(v):
+        return html.escape(str(v))
 
-    lines = ["*Card read. Check it before I save it.*", ""]
+    def b(v):
+        return f"<b>{e(v)}</b>" if v else "—"
+
+    lines = ["<b>Card read. Check it before I save it.</b>", ""]
     lines.append(f"Phone — {b(fmt_phone(data.get('phone')))}")
     lines.append(f"Name — {b(data.get('name'))}")
     lines.append(f"Vehicle — {b(data.get('vehicle'))}")
     lines.append(f"Size — {b(data.get('size'))}")
-    lines.append(f"Stock — {stock_words(data)}")
+    lines.append(f"Stock — {e(stock_words(data))}")
 
     if data.get('price_ours'):
         tail = " with installation" if data.get('price_ours_install') else ""
-        lines.append(f"Our price — *${data['price_ours']}*{tail}")
+        lines.append(f"Our price — <b>${e(data['price_ours'])}</b>{tail}")
     if data.get('price_local'):
         tail = " with installation" if data.get('price_local_install') else ""
-        lines.append(f"Local price — *${data['price_local']}*{tail}")
+        lines.append(f"Local price — <b>${e(data['price_local'])}</b>{tail}")
 
     lines.append(f"Booked — {'yes' if data.get('booked') else 'no'}")
-    lines.append(f"Heard of us — {data.get('heard') or '—'}")
-    lines.append(f"Store — {store or 'NOT SET — tell Sergey'}")
+    lines.append(f"Heard of us — {e(data.get('heard') or '—')}")
+    lines.append(f"Store — {e(store) if store else 'NOT SET — tell Sergey'}")
 
     unread = data.get('unreadable') or []
     if unread:
         lines.append("")
-        lines.append("⚠️ Could not read: " + ", ".join(str(u) for u in unread))
+        lines.append("⚠️ Could not read: " + ", ".join(e(u) for u in unread))
 
     # Two independent ways to catch wrong digits. Neither blocks anything and
     # neither accuses the rep of an error: a walk-in customer never phoned, so
@@ -408,14 +418,14 @@ def confirmation_text(data: dict, store: str, call_check=None,
     want = digits(data.get('phone'))[-10:]
     for got_name, got_phone in (name_matches or []):
         if got_phone and digits(got_phone)[-10:] != want:
-            notes.append(f"Kommo already has *{got_name}* on "
-                         f"*{fmt_phone(got_phone)}*")
+            notes.append(f"Kommo already has <b>{e(got_name)}</b> on "
+                         f"<b>{e(fmt_phone(got_phone))}</b>")
     if notes:
         lines.append("")
         lines.append("⚠️ " + "\n⚠️ ".join(notes))
 
     lines.append("")
-    lines.append(f"_Goes to:_ {stage_name(data)}")
+    lines.append(f"<i>Goes to:</i> {e(stage_name(data))}")
     return "\n".join(lines)
 
 
@@ -688,6 +698,22 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
 
 # -------------------------------------------------------------------- handlers
 
+async def send_html(target, text, **kwargs):
+    """Edit a message as HTML, and if Telegram refuses, send it as plain text.
+
+    A card must never be lost over formatting. 29 August: a correctly read card
+    died because Telegram rejected the markup, and the rep was told to "recover
+    it by hand". Escaping fixes the known cause; this catches the unknown ones.
+    """
+    try:
+        return await target.edit_text(text, parse_mode='HTML', **kwargs)
+    except Exception as exc:
+        log.error("HTML message refused (%s) - falling back to plain", exc)
+        plain = re.sub(r'</?(b|i|code|pre|u|s)>', '', text)
+        plain = html.unescape(plain)
+        return await target.edit_text(plain, **kwargs)
+
+
 KEYBOARD = InlineKeyboardMarkup([[
     InlineKeyboardButton("✅ Correct — save it", callback_data="save"),
     InlineKeyboardButton("✏️ Fix something", callback_data="fix"),
@@ -740,8 +766,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['store'] = store
         context.user_data['awaiting_fix'] = False
 
-        await msg.edit_text(confirmation_text(data, store, check, matches),
-                            parse_mode='Markdown', reply_markup=KEYBOARD)
+        await send_html(msg, confirmation_text(data, store, check, matches),
+                        reply_markup=KEYBOARD)
     except Exception as exc:
         log.error("Card read failed: %s", exc, exc_info=True)
         await msg.edit_text(f"❌ Could not read the card: {exc}")
@@ -760,11 +786,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if query.data == 'fix':
         context.user_data['awaiting_fix'] = True
-        await query.edit_message_text(
-            query.message.text_markdown +
-            "\n\n✏️ Send me the correction in one message, e.g. "
-            "`phone 250 571 4654` or `name Dan Coombs`.",
-            parse_mode='Markdown')
+        # Rebuilt from the data, never re-parsed out of the old message: taking
+        # the message back out of Telegram and feeding it in again is how a
+        # stray character turns into a lost card.
+        await send_html(
+            query.message,
+            confirmation_text(data, context.user_data.get('store', '')) +
+            "\n\n✏️ Send the correction in one message, e.g. "
+            "<code>phone 250 571 4654</code> or <code>name Dan Coombs</code>.")
         return
 
     # save
@@ -806,10 +835,11 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['awaiting_fix'] = False
         check = phone_in_call_log(data.get('phone'))
         matches = contacts_by_name(data.get('name'))
-        await msg.edit_text(
+        await send_html(
+            msg,
             confirmation_text(data, context.user_data.get('store', ''),
                               check, matches),
-            parse_mode='Markdown', reply_markup=KEYBOARD)
+            reply_markup=KEYBOARD)
     except Exception as exc:
         log.error("Correction failed: %s", exc, exc_info=True)
         await msg.edit_text(f"❌ Could not read the correction: {exc}")
@@ -817,20 +847,21 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*KORS Tire — call cards*\n\n"
+        "<b>KORS Tire — call cards</b>\n\n"
         "Photograph a filled-in call card and send it here.\n"
         "I read it, show you what I read, and save it to Kommo "
         "only after you confirm.\n\n"
         "One card = one lead.",
-        parse_mode='Markdown')
+        parse_mode='HTML')
 
 
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = update.effective_user
     store = store_for(update) or "NOT SET"
     await update.message.reply_text(
-        f"User id: `{u.id}`\nChat id: `{update.effective_chat.id}`\n"
-        f"Store: {store}", parse_mode='Markdown')
+        f"User id: <code>{u.id}</code>\n"
+        f"Chat id: <code>{update.effective_chat.id}</code>\n"
+        f"Store: {html.escape(store)}", parse_mode='HTML')
 
 
 async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
