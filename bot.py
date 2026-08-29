@@ -48,6 +48,16 @@ ADMIN_CHAT_ID = os.environ.get('ADMIN_CHAT_ID')
 KOMMO_SUBDOMAIN = os.environ.get('KOMMO_SUBDOMAIN', 'korstire')
 KOMMO_BASE = f'https://{KOMMO_SUBDOMAIN}.kommo.com/api/v4'
 
+# The call log. A card is written during a phone call, so the number on it
+# should appear in the log of calls. When it does not, the digits are usually
+# wrong - which is exactly what happened on the first live card.
+AIRTABLE_TOKEN = os.environ.get('AIRTABLE_TOKEN')
+AIRTABLE_BASE = os.environ.get('AIRTABLE_BASE', 'appMXQet1q0HaBvZo')
+AIRTABLE_CALLS = os.environ.get('AIRTABLE_CALLS', 'tblUkCo2Y47f5viwx')
+CALL_PHONE_FIELD = 'fldfgDIRXEmwYbzne'
+CALL_DATE_FIELD = 'fld7Gzj68GGx0Txpc'
+CALL_LOOKBACK_DAYS = int(os.environ.get('CALL_LOOKBACK_DAYS', '3'))
+
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 CLAUDE_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-5')
 
@@ -112,9 +122,27 @@ Report ONLY what is physically written or ticked on the card. If a field is
 blank, return null. Never infer a value from another field. Never complete a
 partial number. If you cannot read something, return null rather than a guess.
 
+Two rules that come from a real misreading on 29 August 2026:
+
+  A. The card carries faint grey PRINTED examples next to several fields:
+     "250 869 7186" under the phone boxes, "275/60R20" and "35X12.50R20"
+     beside the size rows, "whole dollars, no cents" under the price boxes.
+     These are printed on every blank card. They are NEVER the customer's
+     data. Read only the darker handwriting inside the boxes. On the first
+     live card the phone came back as 250 651-1465 when the boxes plainly
+     held 250 571-4654.
+
+  B. A tick box counts as ticked ONLY if there is a visible pen stroke inside
+     the square. An empty printed square is not a tick. On the same card
+     "with installation" was reported as ticked when both squares were bare.
+     When in doubt, report false and add the field to "unreadable".
+
 The printed layout, so you know where to look:
 
-- PHONE NUMBER: ten digits in boxes, grouped 3-3-4.
+- PHONE NUMBER: exactly ten boxes, grouped 3-3-4, one digit per box. Read them
+  one box at a time, left to right, and do not reorder or drop any. If a box
+  is empty, the number is short - say so in "unreadable" rather than inventing
+  a digit.
 - NAME: one handwritten line.
 - VEHICLE: one handwritten line, meant to hold year, make and model.
 - TIRE SIZE: two rows of boxes. The separators / X . R are pre-printed on the
@@ -233,6 +261,95 @@ def fmt_phone(value) -> str:
     return str(value or '')
 
 
+def phone_in_call_log(phone: str):
+    """Was there a call to or from this number in the last few days?
+
+    Returns True, False, or None when the check could not run at all. None is
+    not "no" - it must never be shown to the rep as a warning, or he learns to
+    ignore warnings.
+
+    This is a check on the DIGITS, not on the customer. It catches a misread
+    box, which is the one failure the rep cannot spot by rereading his own
+    handwriting: the number looks right to him because he wrote it.
+    """
+    if not AIRTABLE_TOKEN:
+        return None
+    want = digits(phone)[-10:]
+    if len(want) < 10:
+        return None
+    since = (datetime.datetime.utcnow()
+             - datetime.timedelta(days=CALL_LOOKBACK_DAYS)).strftime('%Y-%m-%dT%H:%M:%SZ')
+    url = f'https://api.airtable.com/v0/{AIRTABLE_BASE}/{AIRTABLE_CALLS}'
+    params = [('pageSize', 100),
+              ('returnFieldsByFieldId', 'true'),
+              ('fields[]', CALL_PHONE_FIELD),
+              ('filterByFormula',
+               "IS_AFTER({Date/Time}, DATETIME_PARSE('%s'))" % since)]
+    headers = {'Authorization': f'Bearer {AIRTABLE_TOKEN}'}
+    offset = None
+    try:
+        for _ in range(20):
+            p = list(params)
+            if offset:
+                p.append(('offset', offset))
+            r = requests.get(url, headers=headers, params=p, timeout=25)
+            if r.status_code != 200:
+                log.error("Airtable %s: %s", r.status_code, r.text[:200])
+                return None
+            body = r.json()
+            for rec in body.get('records', []):
+                value = rec.get('fields', {}).get(CALL_PHONE_FIELD)
+                if digits(value)[-10:] == want:
+                    return True
+            offset = body.get('offset')
+            if not offset:
+                break
+        return False
+    except Exception as exc:
+        log.error("Call-log check failed: %s", exc)
+        return None
+
+
+def contacts_by_name(name: str):
+    """People already in Kommo whose name matches the card.
+
+    Added 29 August after Sergey's objection to leaning on the call log alone:
+    a customer can walk in off the street having never phoned, and then the
+    absence of a call proves nothing. A name that is already in Kommo against
+    a DIFFERENT number is the second, independent way to catch wrong digits -
+    and it works for walk-ins, where the call log cannot.
+
+    Returns a list of (name, phone) - at most three, so the message stays
+    readable.
+    """
+    name = (name or '').strip()
+    if len(name) < 3:
+        return []
+    out = []
+    try:
+        data = kommo_get('/contacts', {'query': name, 'limit': 25})
+    except Exception as exc:
+        log.error("Name search failed: %s", exc)
+        return []
+    wanted = name.lower()
+    for c in data.get('_embedded', {}).get('contacts', []):
+        got = (c.get('name') or '').strip()
+        if not got:
+            continue
+        # Kommo's query is loose. Keep only real name matches, so the rep is
+        # not shown three strangers and taught to skip the message.
+        if wanted not in got.lower() and got.lower() not in wanted:
+            continue
+        phones = []
+        for f in (c.get('custom_fields_values') or []):
+            if f.get('field_id') == F_CONTACT_PHONE:
+                phones += [v.get('value') for v in (f.get('values') or [])]
+        out.append((got, phones[0] if phones else None))
+        if len(out) == 3:
+            break
+    return out
+
+
 def stock_words(data: dict) -> str:
     parts = []
     if data.get('stock_in'):
@@ -244,7 +361,8 @@ def stock_words(data: dict) -> str:
     return ", ".join(parts) if parts else "—"
 
 
-def confirmation_text(data: dict, store: str) -> str:
+def confirmation_text(data: dict, store: str, call_check=None,
+                      name_matches=None) -> str:
     """What the rep reads before anything is written.
 
     Handwritten fields are bold, because those are the only ones a machine can
@@ -275,6 +393,26 @@ def confirmation_text(data: dict, store: str) -> str:
     if unread:
         lines.append("")
         lines.append("⚠️ Could not read: " + ", ".join(str(u) for u in unread))
+
+    # Two independent ways to catch wrong digits. Neither blocks anything and
+    # neither accuses the rep of an error: a walk-in customer never phoned, so
+    # a missing call is not proof of anything on its own.
+    #
+    # Only False is worth showing for the call log. None means the check did
+    # not run, and a warning that fires when nothing is known is a warning
+    # nobody reads.
+    notes = []
+    if call_check is False:
+        notes.append(f"no call to this number in the last {CALL_LOOKBACK_DAYS} "
+                     f"days — fine if he walked in")
+    want = digits(data.get('phone'))[-10:]
+    for got_name, got_phone in (name_matches or []):
+        if got_phone and digits(got_phone)[-10:] != want:
+            notes.append(f"Kommo already has *{got_name}* on "
+                         f"*{fmt_phone(got_phone)}*")
+    if notes:
+        lines.append("")
+        lines.append("⚠️ " + "\n⚠️ ".join(notes))
 
     lines.append("")
     lines.append(f"_Goes to:_ {stage_name(data)}")
@@ -596,11 +734,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         data = read_card(buf.getvalue())
         store = store_for(update)
+        check = phone_in_call_log(data.get('phone'))
+        matches = contacts_by_name(data.get('name'))
         context.user_data['pending'] = data
         context.user_data['store'] = store
         context.user_data['awaiting_fix'] = False
 
-        await msg.edit_text(confirmation_text(data, store),
+        await msg.edit_text(confirmation_text(data, store, check, matches),
                             parse_mode='Markdown', reply_markup=KEYBOARD)
     except Exception as exc:
         log.error("Card read failed: %s", exc, exc_info=True)
@@ -664,8 +804,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         data.update({k: v for k, v in patch.items() if v is not None})
         context.user_data['pending'] = data
         context.user_data['awaiting_fix'] = False
-        await msg.edit_text(confirmation_text(data, context.user_data.get('store', '')),
-                            parse_mode='Markdown', reply_markup=KEYBOARD)
+        check = phone_in_call_log(data.get('phone'))
+        matches = contacts_by_name(data.get('name'))
+        await msg.edit_text(
+            confirmation_text(data, context.user_data.get('store', ''),
+                              check, matches),
+            parse_mode='Markdown', reply_markup=KEYBOARD)
     except Exception as exc:
         log.error("Correction failed: %s", exc, exc_info=True)
         await msg.edit_text(f"❌ Could not read the correction: {exc}")
@@ -704,6 +848,12 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("✅ Kommo OK")
     except Exception as exc:
         lines.append(f"❌ Kommo FAILED — {type(exc).__name__}: {exc}")
+    if not AIRTABLE_TOKEN:
+        lines.append("⚠️ Call-log check OFF — AIRTABLE_TOKEN not set")
+    else:
+        probe = phone_in_call_log('0000000000')
+        lines.append("✅ Call log reachable" if probe is False
+                     else "❌ Call log NOT reachable")
     lines.append(f"Stores mapped: {len(STORE_BY_USER)}")
     await update.message.reply_text("\n".join(lines))
 
