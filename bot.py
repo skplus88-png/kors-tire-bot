@@ -174,7 +174,15 @@ def parse_claude_json(response) -> dict:
               if getattr(b, 'type', None) == 'text' and getattr(b, 'text', None)]
     raw = "".join(chunks).strip()
     if not raw:
-        raise ValueError("Claude returned no text block")
+        # 29 August: the first live card came back with no text block at all.
+        # The model had spent the whole 900-token budget before it started
+        # writing the answer, so the reply carried nothing but reasoning. The
+        # budget is bigger now; this message says which of the two it was so
+        # the next person does not have to guess.
+        kinds = [getattr(b, 'type', '?') for b in response.content]
+        raise ValueError(
+            f"Claude returned no text. stop_reason={getattr(response, 'stop_reason', '?')}, "
+            f"blocks={kinds or 'none'}")
     raw = raw.replace('```json', '').replace('```', '').strip()
     if not raw.startswith('{'):
         start, end = raw.find('{'), raw.rfind('}')
@@ -187,7 +195,7 @@ def read_card(image_data: bytes) -> dict:
     b64 = base64.standard_b64encode(image_data).decode('utf-8')
     response = claude.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=900,
+        max_tokens=4096,
         messages=[{
             "role": "user",
             "content": [
@@ -204,7 +212,7 @@ def read_card(image_data: bytes) -> dict:
 def read_correction(text: str) -> dict:
     response = claude.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=400,
+        max_tokens=2000,
         messages=[{"role": "user", "content": TEXT_PROMPT + text}],
     )
     return parse_claude_json(response)
@@ -685,7 +693,7 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = []
     try:
         r = claude.messages.create(
-            model=CLAUDE_MODEL, max_tokens=100,
+            model=CLAUDE_MODEL, max_tokens=1000,
             messages=[{"role": "user",
                        "content": 'Return ONLY this JSON: {"ok": true}'}])
         lines.append(f"✅ Claude OK — {CLAUDE_MODEL} — {parse_claude_json(r)}")
