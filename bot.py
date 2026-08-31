@@ -743,26 +743,25 @@ def add_note(lead_id: int, text: str):
 
 
 def record_card_name(contact_id: int, card_name: str, company: str = None):
-    """Put the name from the card into "Goes by". Never touch the real name.
+    """Put the person's name from the card onto the contact.
 
-    Until 31 August the bot replaced a machine-written contact name with the
-    name off the card. It then renamed the company "CSN Dayton" to
-    "CATHY DAYTON CARLTON MCGREGOR", because the card carried a company AND a
-    person and the rule could not tell them apart. A rule that cannot tell
-    those apart has no business editing a name at all.
+    This is safe now because the CARD separates the two things, not the bot.
+    NAME is the person, COMPANY is the firm, two printed lines. On 31 August
+    the same rule renamed the company "CSN Dayton" into a customer - but that
+    card had one line for both, so nothing downstream could tell them apart.
+    The split is forced on paper, where the rep decides, and not guessed here.
 
-    So: the card name is recorded beside the existing one and nothing is
-    overwritten. Nothing is lost, nothing is corrupted, and a human can merge
-    them whenever they like.
+    Rules, still narrow:
+      - only a contact created by an integration (created_by == 0) is renamed,
+        because that name is a Facebook or chat handle, not a person;
+      - a name typed by a human is never touched;
+      - the old handle is kept in "Goes by", so nothing is lost;
+      - the company never goes near the contact name.
+
+    Returns the previous "Goes by" so undo can put it back.
     """
     card_name = (card_name or '').strip()
     if not card_name or not contact_id:
-        return None
-    if (company or '').strip():
-        # A card with a company on it is exactly the case that renamed the
-        # firm "CSN Dayton" into a customer. When a business is involved the
-        # bot writes nothing near the name.
-        log.info("Card carries a company - contact %s name left alone", contact_id)
         return None
     try:
         c = kommo_get(f'/contacts/{contact_id}')
@@ -770,22 +769,38 @@ def record_card_name(contact_id: int, card_name: str, company: str = None):
         log.error("Contact fetch failed: %s", exc)
         return None
 
-    if (c.get('name') or '').strip().lower() == card_name.lower():
-        return None
-    before = None
-    for f in (c.get('custom_fields_values') or []):
-        if f.get('field_id') == F_CONTACT_GOES_BY:
-            before = (f.get('values') or [{}])[0].get('value')
-    if before:
+    old = (c.get('name') or '').strip()
+    if old.lower() == card_name.lower():
         return None
 
-    body = {"custom_fields_values": [
-        {"field_id": F_CONTACT_GOES_BY, "values": [{"value": card_name}]}]}
+    goes_by_before = None
+    for f in (c.get('custom_fields_values') or []):
+        if f.get('field_id') == F_CONTACT_GOES_BY:
+            goes_by_before = (f.get('values') or [{}])[0].get('value')
+
+    body = {}
+    if c.get('created_by') == 0:
+        # A handle from a channel. Replace it with the person, keep the handle.
+        body["name"] = card_name
+        if not goes_by_before and old:
+            body["custom_fields_values"] = [
+                {"field_id": F_CONTACT_GOES_BY, "values": [{"value": old}]}]
+    else:
+        # A person typed this name. Record the card's name beside it instead.
+        if goes_by_before:
+            return None
+        body["custom_fields_values"] = [
+            {"field_id": F_CONTACT_GOES_BY, "values": [{"value": card_name}]}]
+
     r = requests.patch(f"{KOMMO_BASE}/contacts/{contact_id}",
                        headers=HEADERS, json=body, timeout=30)
-    log.info("Goes-by on contact %s = %r | %s", contact_id, card_name,
+    log.info("Contact %s: was %r, created_by=%s, wrote %s | %s",
+             contact_id, old, c.get('created_by'), json.dumps(body)[:200],
              r.status_code)
-    return before if r.status_code in (200, 201) else None
+    if r.status_code not in (200, 201):
+        return None
+    return {"name": old if c.get('created_by') == 0 else None,
+            "goes_by": goes_by_before}
 
 
 def update_contact_vehicle(contact_id: int, vehicle: str):
@@ -873,12 +888,18 @@ def do_undo(u: dict) -> str:
         if u.get('contact_vehicle_before') is not None or u.get('contact_vehicle_written'):
             restore.append({"field_id": F_CONTACT_VEHICLE,
                             "values": [{"value": u.get('contact_vehicle_before') or ""}]})
+        nb = u.get('contact_name_before') or {}
         if u.get('contact_goes_by_written'):
             restore.append({"field_id": F_CONTACT_GOES_BY,
-                            "values": [{"value": u.get('contact_goes_by_before') or ""}]})
+                            "values": [{"value": nb.get('goes_by') or ""}]})
+        body = {}
         if restore:
+            body["custom_fields_values"] = restore
+        if nb.get('name'):
+            body["name"] = nb['name']
+        if body:
             r = requests.patch(f"{KOMMO_BASE}/contacts/{cid}", headers=HEADERS,
-                               json={"custom_fields_values": restore}, timeout=30)
+                               json=body, timeout=30)
             if r.status_code in (200, 201):
                 done.append("contact put back")
 
@@ -987,7 +1008,7 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
             contact_id, data['vehicle'])
         undo["contact_vehicle_written"] = True
     if contact_id:
-        undo['contact_goes_by_before'] = record_card_name(
+        undo['contact_name_before'] = record_card_name(
             contact_id, data.get('name'), data.get('company'))
         undo['contact_goes_by_written'] = True
 
