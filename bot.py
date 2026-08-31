@@ -716,7 +716,10 @@ def create_task(lead_id: int, data: dict):
                       json=payload, timeout=30)
     log.info("Task due %s local | %s %s",
              due.strftime("%Y-%m-%d %H:%M %Z"), r.status_code, r.text[:200])
-    return r.status_code in (200, 201)
+    try:
+        return r.json()['_embedded']['tasks'][0]['id']
+    except Exception:
+        return None
 
 
 def add_note(lead_id: int, text: str):
@@ -724,54 +727,50 @@ def add_note(lead_id: int, text: str):
     r = requests.post(f"{KOMMO_BASE}/leads/{lead_id}/notes",
                       headers=HEADERS, json=payload, timeout=30)
     log.info("Note: %s %s", r.status_code, r.text[:200])
-    return r.status_code in (200, 201)
+    try:
+        return r.json()['_embedded']['notes'][0]['id']
+    except Exception:
+        return None
 
 
-def fix_machine_named_contact(contact_id: int, card_name: str):
-    """Let a name written by a person replace a name written by a machine.
+def record_card_name(contact_id: int, card_name: str):
+    """Put the name from the card into "Goes by". Never touch the real name.
 
-    Kommo names a contact after whatever the channel gives it: a Facebook
-    profile is "Benson Bundy" when the man is Mark Benson. Nobody will ever go
-    back and tidy those by hand - at volume the rep just photographs the next
-    card - so the tidying has to happen by itself.
+    Until 31 August the bot replaced a machine-written contact name with the
+    name off the card. It then renamed the company "CSN Dayton" to
+    "CATHY DAYTON CARLTON MCGREGOR", because the card carried a company AND a
+    person and the rule could not tell them apart. A rule that cannot tell
+    those apart has no business editing a name at all.
 
-    The rule is narrow on purpose:
-      - only when the contact was created by an integration (created_by == 0);
-      - never when a person typed the name, because they know better;
-      - the old name is not lost, it moves to "Goes by", which is the field
-        for exactly that.
+    So: the card name is recorded beside the existing one and nothing is
+    overwritten. Nothing is lost, nothing is corrupted, and a human can merge
+    them whenever they like.
     """
     card_name = (card_name or '').strip()
     if not card_name or not contact_id:
-        return False
+        return None
     try:
         c = kommo_get(f'/contacts/{contact_id}')
     except Exception as exc:
-        log.error("Contact fetch for rename failed: %s", exc)
-        return False
+        log.error("Contact fetch failed: %s", exc)
+        return None
 
-    old = (c.get('name') or '').strip()
-    if c.get('created_by') != 0:
-        log.info("Contact %s named by a person (%s) - name left alone",
-                 contact_id, c.get('created_by'))
-        return False
-    if not old or old.lower() == card_name.lower():
-        return False
-
-    goes_by = None
+    if (c.get('name') or '').strip().lower() == card_name.lower():
+        return None
+    before = None
     for f in (c.get('custom_fields_values') or []):
         if f.get('field_id') == F_CONTACT_GOES_BY:
-            goes_by = (f.get('values') or [{}])[0].get('value')
+            before = (f.get('values') or [{}])[0].get('value')
+    if before:
+        return None
 
-    body = {"name": card_name}
-    if not goes_by:
-        body["custom_fields_values"] = [
-            {"field_id": F_CONTACT_GOES_BY, "values": [{"value": old}]}]
+    body = {"custom_fields_values": [
+        {"field_id": F_CONTACT_GOES_BY, "values": [{"value": card_name}]}]}
     r = requests.patch(f"{KOMMO_BASE}/contacts/{contact_id}",
                        headers=HEADERS, json=body, timeout=30)
-    log.info("Rename contact %s '%s' -> '%s' | %s %s",
-             contact_id, old, card_name, r.status_code, r.text[:300])
-    return r.status_code in (200, 201)
+    log.info("Goes-by on contact %s = %r | %s", contact_id, card_name,
+             r.status_code)
+    return before if r.status_code in (200, 201) else None
 
 
 def update_contact_vehicle(contact_id: int, vehicle: str):
@@ -781,16 +780,109 @@ def update_contact_vehicle(contact_id: int, vehicle: str):
     row in the register of what this region drives — the one asset that cannot
     be bought from anybody.
     """
+    before = None
+    try:
+        c = kommo_get(f'/contacts/{contact_id}')
+        for f in (c.get('custom_fields_values') or []):
+            if f.get('field_id') == F_CONTACT_VEHICLE:
+                before = (f.get('values') or [{}])[0].get('value')
+    except Exception as exc:
+        log.error("Vehicle read-before failed: %s", exc)
+
     payload = {"custom_fields_values": [
         {"field_id": F_CONTACT_VEHICLE, "values": [{"value": vehicle}]}]}
     r = requests.patch(f"{KOMMO_BASE}/contacts/{contact_id}",
                        headers=HEADERS, json=payload, timeout=30)
-    log.info("Vehicle: %s %s", r.status_code, r.text[:200])
-    return r.status_code in (200, 201)
+    log.info("Vehicle on %s: was %r now %r | %s", contact_id, before, vehicle,
+             r.status_code)
+    return before
+
+
+def do_undo(u: dict) -> str:
+    """Put everything back the way the bot found it.
+
+    A rep saves a card by pressing one button, so a rep will sometimes press it
+    on a card that was not right. Undo has to be one button too, standing next
+    to the first, or it does not exist as far as the shop floor is concerned.
+    """
+    done = []
+    lead_id = u.get('lead_id')
+
+    if u.get('task_id'):
+        r = requests.patch(f"{KOMMO_BASE}/tasks/{u['task_id']}",
+                           headers=HEADERS,
+                           json={"is_completed": True,
+                                 "result": {"text": "Card undone"}}, timeout=30)
+        if r.status_code in (200, 201):
+            done.append("task closed")
+
+    if u.get('created') and lead_id:
+        r = requests.delete(f"{KOMMO_BASE}/leads",
+                            headers=HEADERS, json=[{"id": lead_id}], timeout=30)
+        log.info("Undo delete lead %s -> %s %s", lead_id, r.status_code,
+                 r.text[:200])
+        if r.status_code in (200, 202, 204):
+            done.append("lead deleted")
+        else:
+            done.append(f"lead NOT deleted ({r.status_code}) - delete it by hand")
+    elif lead_id and u.get('lead_before'):
+        before = u['lead_before']
+        body = {"status_id": before.get('status_id')}
+        body["price"] = before.get('price') or 0
+        fields = []
+        for f in (before.get('custom_fields_values') or []):
+            fields.append({"field_id": f['field_id'],
+                           "values": [{k: v for k, v in val.items()
+                                       if k in ('value', 'enum_id')}
+                                      for val in f.get('values', [])]})
+        if fields:
+            body["custom_fields_values"] = fields
+        r = requests.patch(f"{KOMMO_BASE}/leads/{lead_id}", headers=HEADERS,
+                           json=body, timeout=30)
+        log.info("Undo restore lead %s -> %s %s", lead_id, r.status_code,
+                 r.text[:300])
+        if r.status_code in (200, 201):
+            done.append("lead put back")
+
+    cid = u.get('contact_id')
+    if cid:
+        restore = []
+        if u.get('contact_vehicle_before') is not None or u.get('contact_vehicle_written'):
+            restore.append({"field_id": F_CONTACT_VEHICLE,
+                            "values": [{"value": u.get('contact_vehicle_before') or ""}]})
+        if u.get('contact_goes_by_written'):
+            restore.append({"field_id": F_CONTACT_GOES_BY,
+                            "values": [{"value": u.get('contact_goes_by_before') or ""}]})
+        if restore:
+            r = requests.patch(f"{KOMMO_BASE}/contacts/{cid}", headers=HEADERS,
+                               json={"custom_fields_values": restore}, timeout=30)
+            if r.status_code in (200, 201):
+                done.append("contact put back")
+
+    if u.get('note_id') and lead_id:
+        add_note(lead_id, "The card above was undone by the rep. "
+                          "Everything this bot wrote has been reversed.")
+
+    return ", ".join(done) if done else "nothing could be reversed"
+
+
+def snapshot(lead: dict) -> dict:
+    """Everything about a lead that this bot is capable of changing."""
+    return {"status_id": lead.get("status_id"),
+            "price": lead.get("price"),
+            "custom_fields_values": lead.get("custom_fields_values") or []}
 
 
 def save_to_kommo(data: dict, store: str, who: str) -> tuple:
-    """Returns (ok, message, lead_id, lead_link, was_existing)."""
+    """Returns (ok, message, lead_id, lead_link, was_existing, undo).
+
+    The undo record is written as we go, not reconstructed afterwards: the only
+    moment the previous values are knowable for certain is before we overwrite
+    them.
+    """
+    undo = {"lead_id": None, "created": False, "lead_before": None,
+            "contact_id": None, "contact_vehicle_before": None,
+            "contact_goes_by_before": None, "note_id": None, "task_id": None}
     phone = data.get('phone')
     contact_id, contact_name = find_contact_by_phone(phone) if phone else (None, None)
 
@@ -810,11 +902,12 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
         if fields:
             body["custom_fields_values"] = fields
         log.info("PATCH lead %s body=%s", lead_id, json.dumps(body)[:900])
+        undo["lead_before"] = snapshot(existing)
         r = requests.patch(f"{KOMMO_BASE}/leads/{lead_id}",
                            headers=HEADERS, json=body, timeout=30)
         log.info("PATCH lead %s -> %s %s", lead_id, r.status_code, r.text[:900])
         if r.status_code not in (200, 201):
-            return False, f"Kommo {r.status_code}: {r.text[:200]}", None, None, True
+            return False, f"Kommo {r.status_code}: {r.text[:200]}", None, None, True, undo
         was_existing = True
     else:
         lead = {"name": lead_title(data),
@@ -843,7 +936,7 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
 
         log.info("CREATE lead -> %s %s", r.status_code, r.text[:900])
         if r.status_code not in (200, 201):
-            return False, f"Kommo {r.status_code}: {r.text[:200]}", None, None, False
+            return False, f"Kommo {r.status_code}: {r.text[:200]}", None, None, False, undo
 
         try:
             result = r.json()
@@ -855,21 +948,28 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
                 leads = result.get('_embedded', {}).get('leads', [])
                 lead_id = leads[0].get('id') if leads else None
         except Exception as exc:
-            return False, f"Kommo replied but could not be read: {exc}", None, None, False
+            return False, f"Kommo replied but could not be read: {exc}", None, None, False, undo
         was_existing = False
+        undo["created"] = True
 
     if not lead_id:
-        return False, "Kommo did not return a lead id", None, None, was_existing
+        return False, "Kommo did not return a lead id", None, None, was_existing, undo
 
-    add_note(lead_id, note_text(data, store, who))
-    create_task(lead_id, data)
+    undo["lead_id"] = lead_id
+    undo["contact_id"] = contact_id
+    undo["note_id"] = add_note(lead_id, note_text(data, store, who))
+    undo["task_id"] = create_task(lead_id, data)
     if contact_id and data.get('vehicle'):
-        update_contact_vehicle(contact_id, data['vehicle'])
+        undo["contact_vehicle_before"] = update_contact_vehicle(
+            contact_id, data['vehicle'])
+        undo["contact_vehicle_written"] = True
     if contact_id:
-        fix_machine_named_contact(contact_id, data.get('name'))
+        undo['contact_goes_by_before'] = record_card_name(
+            contact_id, data.get('name'))
+        undo['contact_goes_by_written'] = True
 
     link = f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/detail/{lead_id}"
-    return True, "", lead_id, link, was_existing
+    return True, "", lead_id, link, was_existing, undo
 
 
 # -------------------------------------------------------------------- handlers
@@ -956,8 +1056,21 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     data = context.user_data.get('pending')
 
-    if not data:
+    if not data and query.data != 'undo':
         await query.edit_message_text("This card has expired. Send the photo again.")
+        return
+
+    if query.data == 'undo':
+        u = context.user_data.get('undo')
+        if not u:
+            await query.edit_message_text(
+                query.message.text +
+                "\n\n↩️ Too late to undo from here — tell Sergey.")
+            return
+        await query.edit_message_text("⏳ Putting it back…")
+        result = do_undo(u)
+        context.user_data['undo'] = None
+        await query.edit_message_text(f"↩️ Undone: {result}")
         return
 
     if query.data == 'fix':
@@ -975,7 +1088,7 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # save
     await query.edit_message_text("⏳ Saving to Kommo…")
     store = context.user_data.get('store', '')
-    ok, err, lead_id, link, existing = save_to_kommo(data, store, who_for(update))
+    ok, err, lead_id, link, existing, undo = save_to_kommo(data, store, who_for(update))
 
     if not ok:
         await query.edit_message_text(f"❌ Kommo refused it:\n{err}")
@@ -984,10 +1097,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     context.user_data['pending'] = None
+    context.user_data['undo'] = undo
     head = ("♻️ Added to the lead this customer already had"
             if existing else "✅ Lead created")
     await query.edit_message_text(
-        f"{head}\n\n{lead_title(data)}\n{stage_name(data)}\n\n{link}")
+        f"{head}\n\n{lead_title(data)}\n{stage_name(data)}\n\n{link}",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("↩️ Undo — I saved it by mistake",
+                                 callback_data="undo")]]))
 
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
