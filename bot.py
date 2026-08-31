@@ -59,6 +59,17 @@ CALL_PHONE_FIELD = 'fldfgDIRXEmwYbzne'
 CALL_DATE_FIELD = 'fld7Gzj68GGx0Txpc'
 CALL_LOOKBACK_DAYS = int(os.environ.get('CALL_LOOKBACK_DAYS', '3'))
 
+# The container runs on UTC. Tasks are for people in Kelowna and Vernon, so
+# every due date is worked out in their time. 31 August: the first live card
+# produced a follow-up task due at 03:00, because "tomorrow at 10:00" was
+# 10:00 UTC.
+try:
+    from zoneinfo import ZoneInfo
+    LOCAL_TZ = ZoneInfo(os.environ.get('LOCAL_TZ', 'America/Vancouver'))
+except Exception as _tz_exc:          # tzdata missing - better wrong than dead
+    logging.error("Timezone database unavailable (%s), falling back to -07:00", _tz_exc)
+    LOCAL_TZ = datetime.timezone(datetime.timedelta(hours=-7))
+
 claude = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 CLAUDE_MODEL = os.environ.get('ANTHROPIC_MODEL', 'claude-sonnet-5')
 
@@ -659,7 +670,7 @@ def create_task(lead_id: int, data: dict):
     A lead with no task is exactly the lead this whole project exists to stop
     losing, so this is not optional and it is not conditional.
     """
-    tomorrow = datetime.datetime.now() + datetime.timedelta(days=1)
+    tomorrow = datetime.datetime.now(LOCAL_TZ) + datetime.timedelta(days=1)
     due = tomorrow.replace(hour=10, minute=0, second=0, microsecond=0)
     if data.get('booked'):
         text = "Confirm the booking with the customer"
@@ -674,7 +685,8 @@ def create_task(lead_id: int, data: dict):
                 "task_type_id": 1}]
     r = requests.post(f"{KOMMO_BASE}/tasks", headers=HEADERS,
                       json=payload, timeout=30)
-    log.info("Task: %s %s", r.status_code, r.text[:200])
+    log.info("Task due %s local | %s %s",
+             due.strftime("%Y-%m-%d %H:%M %Z"), r.status_code, r.text[:200])
     return r.status_code in (200, 201)
 
 
@@ -721,8 +733,10 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
             body["price"] = int(price)
         if fields:
             body["custom_fields_values"] = fields
+        log.info("PATCH lead %s body=%s", lead_id, json.dumps(body)[:900])
         r = requests.patch(f"{KOMMO_BASE}/leads/{lead_id}",
                            headers=HEADERS, json=body, timeout=30)
+        log.info("PATCH lead %s -> %s %s", lead_id, r.status_code, r.text[:900])
         if r.status_code not in (200, 201):
             return False, f"Kommo {r.status_code}: {r.text[:200]}", None, None, True
         was_existing = True
@@ -737,6 +751,8 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
 
         if contact_id:
             lead["_embedded"] = {"contacts": [{"id": contact_id}]}
+            log.info("CREATE lead on contact %s body=%s", contact_id,
+                     json.dumps(lead)[:900])
             r = requests.post(f"{KOMMO_BASE}/leads", headers=HEADERS,
                               json=[lead], timeout=30)
         else:
@@ -749,6 +765,7 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
             r = requests.post(f"{KOMMO_BASE}/leads/complex", headers=HEADERS,
                               json=[lead], timeout=30)
 
+        log.info("CREATE lead -> %s %s", r.status_code, r.text[:900])
         if r.status_code not in (200, 201):
             return False, f"Kommo {r.status_code}: {r.text[:200]}", None, None, False
 
