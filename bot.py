@@ -104,6 +104,7 @@ F_RESULT = 974690             # multiselect
 F_WAITING_FOR = 997558        # select
 F_CONTACT_PHONE = 807760      # multitext
 F_CONTACT_VEHICLE = 997380    # text
+F_CONTACT_GOES_BY = 997378    # text
 
 E_BRAND_LOCAL = 836283
 E_INSTALL_YES = 836315
@@ -698,6 +699,53 @@ def add_note(lead_id: int, text: str):
     return r.status_code in (200, 201)
 
 
+def fix_machine_named_contact(contact_id: int, card_name: str):
+    """Let a name written by a person replace a name written by a machine.
+
+    Kommo names a contact after whatever the channel gives it: a Facebook
+    profile is "Benson Bundy" when the man is Mark Benson. Nobody will ever go
+    back and tidy those by hand - at volume the rep just photographs the next
+    card - so the tidying has to happen by itself.
+
+    The rule is narrow on purpose:
+      - only when the contact was created by an integration (created_by == 0);
+      - never when a person typed the name, because they know better;
+      - the old name is not lost, it moves to "Goes by", which is the field
+        for exactly that.
+    """
+    card_name = (card_name or '').strip()
+    if not card_name or not contact_id:
+        return False
+    try:
+        c = kommo_get(f'/contacts/{contact_id}')
+    except Exception as exc:
+        log.error("Contact fetch for rename failed: %s", exc)
+        return False
+
+    old = (c.get('name') or '').strip()
+    if c.get('created_by') != 0:
+        log.info("Contact %s named by a person (%s) - name left alone",
+                 contact_id, c.get('created_by'))
+        return False
+    if not old or old.lower() == card_name.lower():
+        return False
+
+    goes_by = None
+    for f in (c.get('custom_fields_values') or []):
+        if f.get('field_id') == F_CONTACT_GOES_BY:
+            goes_by = (f.get('values') or [{}])[0].get('value')
+
+    body = {"name": card_name}
+    if not goes_by:
+        body["custom_fields_values"] = [
+            {"field_id": F_CONTACT_GOES_BY, "values": [{"value": old}]}]
+    r = requests.patch(f"{KOMMO_BASE}/contacts/{contact_id}",
+                       headers=HEADERS, json=body, timeout=30)
+    log.info("Rename contact %s '%s' -> '%s' | %s %s",
+             contact_id, old, card_name, r.status_code, r.text[:300])
+    return r.status_code in (200, 201)
+
+
 def update_contact_vehicle(contact_id: int, vehicle: str):
     """The vehicle lives on the person, not on the deal.
 
@@ -789,6 +837,8 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
     create_task(lead_id, data)
     if contact_id and data.get('vehicle'):
         update_contact_vehicle(contact_id, data['vehicle'])
+    if contact_id:
+        fix_machine_named_contact(contact_id, data.get('name'))
 
     link = f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/detail/{lead_id}"
     return True, "", lead_id, link, was_existing
