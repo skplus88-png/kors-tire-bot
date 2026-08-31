@@ -817,14 +817,22 @@ def do_undo(u: dict) -> str:
             done.append("task closed")
 
     if u.get('created') and lead_id:
-        r = requests.delete(f"{KOMMO_BASE}/leads",
-                            headers=HEADERS, json=[{"id": lead_id}], timeout=30)
-        log.info("Undo delete lead %s -> %s %s", lead_id, r.status_code,
+        # Kommo's public API cannot delete a lead. Verified 31 August against
+        # the live account: DELETE /api/v4/leads -> 405, DELETE
+        # /api/v4/leads/{id} -> 405, POST .../delete -> 404. So undo does the
+        # next best thing and makes the lead impossible to mistake for work:
+        # emptied, closed lost, and named so it sorts to the eye.
+        body = {"name": "\u274c DELETE ME - card undone",
+                "price": 0, "status_id": CLOSED_LOST}
+        r = requests.patch(f"{KOMMO_BASE}/leads/{lead_id}", headers=HEADERS,
+                           json=body, timeout=30)
+        log.info("Undo mark lead %s -> %s %s", lead_id, r.status_code,
                  r.text[:200])
-        if r.status_code in (200, 202, 204):
-            done.append("lead deleted")
+        if r.status_code in (200, 201):
+            done.append("lead emptied and marked DELETE ME (Kommo's API "
+                        "cannot delete it - remove it in Kommo)")
         else:
-            done.append(f"lead NOT deleted ({r.status_code}) - delete it by hand")
+            done.append(f"could not mark the lead ({r.status_code})")
     elif lead_id and u.get('lead_before'):
         before = u['lead_before']
         body = {"status_id": before.get('status_id')}
