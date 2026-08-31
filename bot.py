@@ -198,7 +198,7 @@ Return ONLY valid JSON, no markdown fence, no commentary:
   "size": "as written with its separators, e.g. 275/60R20, or null",
   "price_ours": whole number or null,
   "price_local": whole number or null,
-  "unreadable": ["names of fields you could not read confidently"]
+  "unreadable": ["fields you could not READ. A blank box is not\n                  unreadable - a blank box is simply an answer of no."]
 }
 
 The two examples above are the shape, not the answer. Read the card in front
@@ -226,6 +226,29 @@ HEARD_FROM_TICK = {"google": "google", "castanet": "castanet",
                    "been_here_before": "repeat"}
 
 
+SIZE_SHAPES = (re.compile(r'^\d{3}/\d{2}R\d{2}$'),
+               re.compile(r'^\d{2}X\d{2}\.\d{2}R\d{2}$'))
+
+
+def clean_size(value):
+    """Keep the size only if it has a shape the card can physically hold.
+
+    The two rows are [3][3? no - 2] boxes with printed separators, so the only
+    possible answers are 305/55R20 and 35X12.50R20. 31 August a card came back
+    as "305/155R20": the machine read the printed "/" as a handwritten 1. Three
+    digits do not fit in that group, so the answer was impossible on its face -
+    and a plausible wrong size is worse than an empty field, because nobody
+    catches it.
+    """
+    v = (value or '').strip().upper().replace(' ', '')
+    if not v:
+        return None, False
+    if any(p.match(v) for p in SIZE_SHAPES):
+        return v, False
+    log.info("Size %r does not fit either row of the card - dropped", value)
+    return None, True
+
+
 def normalise_card(raw: dict) -> dict:
     """Turn the model's evidence into the flat card the rest of the code uses.
 
@@ -249,11 +272,16 @@ def normalise_card(raw: dict) -> dict:
             heard = value
             break
 
+    size, size_bad = clean_size(raw.get('size'))
+    unreadable = list(raw.get('unreadable') or [])
+    if size_bad:
+        unreadable.append('size (impossible shape - check the boxes)')
+
     return {
         'phone': phone,
         'name': raw.get('name'),
         'vehicle': raw.get('vehicle'),
-        'size': raw.get('size'),
+        'size': size,
         'stock_in': 'in_stock' in ticked,
         'stock_out': 'out_of_stock' in ticked,
         'stock_local': 'local_offer' in ticked,
@@ -263,7 +291,7 @@ def normalise_card(raw: dict) -> dict:
         'price_local_install': 'local_with_installation' in ticked,
         'booked': 'booked' in ticked,
         'heard': heard,
-        'unreadable': raw.get('unreadable') or [],
+        'unreadable': unreadable,
     }
 
 
@@ -298,7 +326,7 @@ def read_card(image_data: bytes) -> dict:
     b64 = base64.standard_b64encode(image_data).decode('utf-8')
     response = claude.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=4096,
+        max_tokens=8000,
         messages=[{
             "role": "user",
             "content": [
