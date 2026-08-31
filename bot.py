@@ -156,7 +156,10 @@ The printed layout, so you know where to look:
   one box at a time, left to right, and do not reorder or drop any. If a box
   is empty, the number is short - say so in "unreadable" rather than inventing
   a digit.
-- NAME: one handwritten line.
+- NAME: one handwritten line - the person.
+- COMPANY: one handwritten line, often blank. Only filled when the customer
+  is buying for a business. Never put a person's name here and never put a
+  company in NAME - the card keeps them apart on purpose.
 - VEHICLE: one handwritten line, meant to hold year, make and model.
 - TIRE SIZE: two rows of boxes. The separators / X . R are pre-printed on the
   card, the rep only fills digits. Row one is like 275/60R20, row two is like
@@ -193,7 +196,8 @@ Return ONLY valid JSON, no markdown fence, no commentary:
 {
   "phone_boxes": ["2","5","0","5","7","1","4","6","5","4"],
   "ticked": ["out_of_stock", "local_offer", "booked", "facebook"],
-  "name": "as written, or null",
+  "name": "the person, as written, or null",
+  "company": "the business, as written, or null",
   "vehicle": "as written, or null",
   "size": "as written with its separators, e.g. 275/60R20, or null",
   "price_ours": whole number or null,
@@ -207,7 +211,7 @@ of you."""
 TEXT_PROMPT = """The following is a correction typed by a KORS Tire rep for a
 call card that was just read from a photograph. Return ONLY the fields the rep
 is correcting, as valid JSON using these exact keys where they apply: phone,
-name, vehicle, size, stock_in, stock_out, stock_local, price_ours,
+name, company, vehicle, size, stock_in, stock_out, stock_local, price_ours,
 price_ours_install, price_local, price_local_install, booked, heard.
 
 Return an empty object {} if nothing in the message is a field correction.
@@ -280,6 +284,7 @@ def normalise_card(raw: dict) -> dict:
     return {
         'phone': phone,
         'name': raw.get('name'),
+        'company': raw.get('company'),
         'vehicle': raw.get('vehicle'),
         'size': size,
         'stock_in': 'in_stock' in ticked,
@@ -498,6 +503,8 @@ def confirmation_text(data: dict, store: str, call_check=None,
     lines = ["<b>Card read. Check it before I save it.</b>", ""]
     lines.append(f"Phone — {b(fmt_phone(data.get('phone')))}")
     lines.append(f"Name — {b(data.get('name'))}")
+    if data.get('company'):
+        lines.append(f"Company — {b(data.get('company'))}")
     lines.append(f"Vehicle — {b(data.get('vehicle'))}")
     lines.append(f"Size — {b(data.get('size'))}")
     lines.append(f"Stock — {e(stock_words(data))}")
@@ -671,6 +678,8 @@ def lead_fields(data: dict, store: str) -> list:
 
 def note_text(data: dict, store: str, who: str) -> str:
     parts = ["Call card"]
+    if data.get('company'):
+        parts.append(f"Company: {data['company']}")
     if data.get('vehicle'):
         parts.append(f"Vehicle: {data['vehicle']}")
     if data.get('price_ours'):
@@ -733,7 +742,7 @@ def add_note(lead_id: int, text: str):
         return None
 
 
-def record_card_name(contact_id: int, card_name: str):
+def record_card_name(contact_id: int, card_name: str, company: str = None):
     """Put the name from the card into "Goes by". Never touch the real name.
 
     Until 31 August the bot replaced a machine-written contact name with the
@@ -748,6 +757,12 @@ def record_card_name(contact_id: int, card_name: str):
     """
     card_name = (card_name or '').strip()
     if not card_name or not contact_id:
+        return None
+    if (company or '').strip():
+        # A card with a company on it is exactly the case that renamed the
+        # firm "CSN Dayton" into a customer. When a business is involved the
+        # bot writes nothing near the name.
+        log.info("Card carries a company - contact %s name left alone", contact_id)
         return None
     try:
         c = kommo_get(f'/contacts/{contact_id}')
@@ -973,7 +988,7 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
         undo["contact_vehicle_written"] = True
     if contact_id:
         undo['contact_goes_by_before'] = record_card_name(
-            contact_id, data.get('name'))
+            contact_id, data.get('name'), data.get('company'))
         undo['contact_goes_by_written'] = True
 
     link = f"https://{KOMMO_SUBDOMAIN}.kommo.com/leads/detail/{lead_id}"
