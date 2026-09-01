@@ -82,6 +82,13 @@ for pair in os.environ.get('STORE_BY_USER', '').split(','):
         uid, store = pair.split(':', 1)
         STORE_BY_USER[uid.strip()] = store.strip()
 
+# The scan itself. Kommo holds what the bot READ; this folder holds what the rep
+# actually WROTE. When the two disagree, the paper is the truth, and the lead
+# manager needs to be able to look at it without asking anyone for the card.
+DROPBOX_APP_KEY = os.environ.get('DROPBOX_APP_KEY')
+DROPBOX_APP_SECRET = os.environ.get('DROPBOX_APP_SECRET')
+DROPBOX_REFRESH_TOKEN = os.environ.get('DROPBOX_REFRESH_TOKEN')
+
 # ------------------------------------------------------------- Kommo constants
 # All of these were read off GET /api/v4/*/custom_fields on 29 August 2026.
 # None of them are remembered or assumed.
@@ -1034,6 +1041,96 @@ async def send_html(target, text, **kwargs):
         return await target.edit_text(plain, **kwargs)
 
 
+# ------------------------------------------------------------------- the scans
+# Dropbox app "KORS Card Scans", App folder access: the app can see its own
+# folder and nothing else in the Dropbox. Files land in
+#   Dropbox/Apps/KORS Card Scans/2026-09-01 07-16 Kelowna - Rob Tallman.jpg
+# Date first so the folder sorts by itself, then the store, then the customer.
+
+_DBX_TOKEN = {'value': None, 'expires': datetime.datetime.min}
+
+# Dropbox refuses these in a path; a customer name can carry any of them.
+BAD_IN_NAME = re.compile(r'[/\\:?*"<>|]')
+
+
+def dropbox_ready() -> bool:
+    return bool(DROPBOX_APP_KEY and DROPBOX_APP_SECRET and DROPBOX_REFRESH_TOKEN)
+
+
+def dropbox_token() -> str:
+    """A short-lived access token, refreshed a minute before it dies."""
+    now = datetime.datetime.utcnow()
+    if _DBX_TOKEN['value'] and now < _DBX_TOKEN['expires']:
+        return _DBX_TOKEN['value']
+    r = requests.post('https://api.dropboxapi.com/oauth2/token',
+                      data={'grant_type': 'refresh_token',
+                            'refresh_token': DROPBOX_REFRESH_TOKEN},
+                      auth=(DROPBOX_APP_KEY, DROPBOX_APP_SECRET), timeout=20)
+    if r.status_code != 200:
+        raise RuntimeError(f"Dropbox refused the refresh token: "
+                           f"{r.status_code} {r.text[:200]}")
+    body = r.json()
+    _DBX_TOKEN['value'] = body['access_token']
+    _DBX_TOKEN['expires'] = now + datetime.timedelta(
+        seconds=int(body.get('expires_in', 14400)) - 60)
+    return _DBX_TOKEN['value']
+
+
+def scan_filename(data, store, when=None) -> str:
+    when = when or datetime.datetime.now(LOCAL_TZ)
+    stamp = when.strftime('%Y-%m-%d %H-%M')
+    where = store or 'Unknown'
+    who = (data.get('name') or data.get('company') or 'No name').strip()
+    who = BAD_IN_NAME.sub(' ', who)
+    who = re.sub(r'\s+', ' ', who).strip()[:60] or 'No name'
+    return f"{stamp} {where} - {who}.jpg"
+
+
+def upload_scan(image: bytes, filename: str):
+    """Put one card in the folder. Returns (ok, path_or_error).
+
+    A failure here must never cost a lead: the caller logs it and carries on.
+    """
+    if not dropbox_ready():
+        return False, "Dropbox not configured"
+    try:
+        path = '/' + filename
+        args = {'path': path, 'mode': 'add', 'autorename': True,
+                'mute': True, 'strict_conflict': False}
+        r = requests.post(
+            'https://content.dropboxapi.com/2/files/upload',
+            headers={'Authorization': f'Bearer {dropbox_token()}',
+                     'Dropbox-API-Arg': json.dumps(args),
+                     'Content-Type': 'application/octet-stream'},
+            data=image, timeout=60)
+        if r.status_code != 200:
+            return False, f"{r.status_code} {r.text[:200]}"
+        return True, r.json().get('path_display', path)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def rename_scan(old_path: str, new_filename: str):
+    """The rep corrected the name after the read. Move the file to match."""
+    if not old_path or not dropbox_ready():
+        return False, "nothing to move"
+    new_path = '/' + new_filename
+    if old_path == new_path:
+        return True, old_path
+    try:
+        r = requests.post(
+            'https://api.dropboxapi.com/2/files/move_v2',
+            headers={'Authorization': f'Bearer {dropbox_token()}',
+                     'Content-Type': 'application/json'},
+            json={'from_path': old_path, 'to_path': new_path,
+                  'autorename': True}, timeout=30)
+        if r.status_code != 200:
+            return False, f"{r.status_code} {r.text[:200]}"
+        return True, r.json()['metadata'].get('path_display', new_path)
+    except Exception as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
 KEYBOARD = InlineKeyboardMarkup([[
     InlineKeyboardButton("✅ Correct — save it", callback_data="save"),
     InlineKeyboardButton("✏️ Fix something", callback_data="fix"),
@@ -1072,27 +1169,57 @@ async def notify_admin(context, update, error_text: str):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Reading the card…")
+    store = store_for(update)
+    when = datetime.datetime.now(LOCAL_TZ)
+
     try:
         photo = update.message.photo[-1]
         f = await context.bot.get_file(photo.file_id)
         buf = io.BytesIO()
         await f.download_to_memory(buf)
-
-        data = read_card(buf.getvalue())
-        store = store_for(update)
-        check = phone_in_call_log(data.get('phone'))
-        matches = contacts_by_name(data.get('name'))
-        context.user_data['pending'] = data
-        context.user_data['store'] = store
-        context.user_data['awaiting_fix'] = False
-
-        await send_html(msg, confirmation_text(data, store, check, matches),
-                        reply_markup=KEYBOARD)
+        image = buf.getvalue()
     except Exception as exc:
-        log.error("Card read failed: %s", exc, exc_info=True)
-        await msg.edit_text(f"❌ Could not read the card: {exc}")
+        log.error("Could not fetch the photo: %s", exc, exc_info=True)
+        await msg.edit_text(f"❌ Could not fetch the photo: {exc}")
         await notify_admin(context, update,
-                           f"Reading the photo failed.\n{type(exc).__name__}: {exc}")
+                           f"Telegram photo download failed.\n{type(exc).__name__}: {exc}")
+        return
+
+    data, read_error = None, None
+    try:
+        data = read_card(image)
+    except Exception as exc:
+        read_error = exc
+        log.error("Card read failed: %s", exc, exc_info=True)
+
+    # The scan is filed whether or not the reading worked. When it did not, this
+    # photograph is the only record of that call that exists anywhere.
+    scan_ok, scan_where = upload_scan(
+        image, scan_filename(data or {'name': 'UNREAD'}, store, when))
+    if scan_ok:
+        log.info("Scan filed: %s", scan_where)
+    else:
+        log.error("Scan NOT filed: %s", scan_where)
+    context.user_data['scan_path'] = scan_where if scan_ok else None
+    context.user_data['scan_when'] = when
+
+    if data is None:
+        await msg.edit_text(f"❌ Could not read the card: {read_error}")
+        await notify_admin(
+            context, update,
+            f"Reading the photo failed.\n{type(read_error).__name__}: {read_error}\n"
+            + (f"The photo is filed as {scan_where}" if scan_ok
+               else f"The photo was NOT filed either: {scan_where}"))
+        return
+
+    check = phone_in_call_log(data.get('phone'))
+    matches = contacts_by_name(data.get('name'))
+    context.user_data['pending'] = data
+    context.user_data['store'] = store
+    context.user_data['awaiting_fix'] = False
+
+    await send_html(msg, confirmation_text(data, store, check, matches),
+                    reply_markup=KEYBOARD)
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1139,6 +1266,14 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await notify_admin(context, update,
                            f"{err}\n\nCard: {json.dumps(data, ensure_ascii=False)}")
         return
+
+    # If the rep corrected the name, the scan is filed under the wrong one.
+    # Move it, so the folder and Kommo call the customer the same thing.
+    old_scan = context.user_data.get('scan_path')
+    if old_scan:
+        moved, where = rename_scan(
+            old_scan, scan_filename(data, store, context.user_data.get('scan_when')))
+        log.info("Scan %s: %s", "moved" if moved else "NOT moved", where)
 
     context.user_data['pending'] = None
     context.user_data['undo'] = undo
@@ -1222,6 +1357,14 @@ async def health(update: Update, context: ContextTypes.DEFAULT_TYPE):
         found, _ = phone_in_call_log('0000000000')
         lines.append("✅ Call log reachable" if found is False
                      else "❌ Call log NOT reachable")
+    if not dropbox_ready():
+        lines.append("⚠️ Card scans NOT filed — Dropbox keys not set")
+    else:
+        try:
+            dropbox_token()
+            lines.append("✅ Dropbox OK — scans are filed")
+        except Exception as exc:
+            lines.append(f"❌ Dropbox FAILED — {type(exc).__name__}: {exc}")
     lines.append(f"Stores mapped: {len(STORE_BY_USER)}")
     await update.message.reply_text("\n".join(lines))
 
