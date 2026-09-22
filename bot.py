@@ -1131,10 +1131,25 @@ def rename_scan(old_path: str, new_filename: str):
         return False, f"{type(exc).__name__}: {exc}"
 
 
-KEYBOARD = InlineKeyboardMarkup([[
-    InlineKeyboardButton("✅ Correct — save it", callback_data="save"),
-    InlineKeyboardButton("✏️ Fix something", callback_data="fix"),
-]])
+STORE_BUTTONS = ("Kelowna", "Vernon", "Vancouver Island", "Online")
+
+
+def keyboard_for(store: str) -> InlineKeyboardMarkup:
+    """The store is a fact the card itself does not carry.
+
+    A rep who works one shop has it set once in STORE_BY_USER and never thinks
+    about it again. The leads manager takes cards for every shop, so for her it
+    is a question, and it is asked here - one tap, on the card in front of her,
+    instead of a lead filed against the wrong store.
+    """
+    picked = (store or '').strip().lower()
+    row = [InlineKeyboardButton(("\u25cf " if s.lower() == picked else "") + s,
+                                callback_data="store:" + s)
+           for s in STORE_BUTTONS]
+    return InlineKeyboardMarkup([row[:2], row[2:], [
+        InlineKeyboardButton("\u2705 Correct \u2014 save it", callback_data="save"),
+        InlineKeyboardButton("\u270f\ufe0f Fix something", callback_data="fix"),
+    ]])
 
 
 def store_for(update: Update) -> str:
@@ -1214,12 +1229,14 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     check = phone_in_call_log(data.get('phone'))
     matches = contacts_by_name(data.get('name'))
+
+    context.user_data['warn'] = (check, matches)
     context.user_data['pending'] = data
     context.user_data['store'] = store
     context.user_data['awaiting_fix'] = False
 
     await send_html(msg, confirmation_text(data, store, check, matches),
-                    reply_markup=KEYBOARD)
+                    reply_markup=keyboard_for(context.user_data.get('store', '')))
 
 
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1256,9 +1273,23 @@ async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "<code>phone 250 571 4654</code> or <code>name Dan Coombs</code>.")
         return
 
+    if query.data.startswith('store:'):
+        store = query.data.split(':', 1)[1]
+        context.user_data['store'] = store
+        warn = context.user_data.get('warn') or (None, [])
+        await send_html(query.message,
+                        confirmation_text(data, store, warn[0], warn[1]),
+                        reply_markup=keyboard_for(store))
+        return
+
     # save
-    await query.edit_message_text("⏳ Saving to Kommo…")
     store = context.user_data.get('store', '')
+    if not store:
+        await query.message.reply_text(
+            "Pick the store first — Kelowna, Vernon, Vancouver Island or "
+            "Online. Nothing is saved until the lead has one.")
+        return
+    await query.edit_message_text("⏳ Saving to Kommo…")
     ok, err, lead_id, link, existing, undo = save_to_kommo(data, store, who_for(update))
 
     if not ok:
@@ -1307,11 +1338,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data['awaiting_fix'] = False
         check = phone_in_call_log(data.get('phone'))
         matches = contacts_by_name(data.get('name'))
+        context.user_data['warn'] = (check, matches)
         await send_html(
             msg,
             confirmation_text(data, context.user_data.get('store', ''),
                               check, matches),
-            reply_markup=KEYBOARD)
+            reply_markup=keyboard_for(context.user_data.get('store', '')))
     except Exception as exc:
         log.error("Correction failed: %s", exc, exc_info=True)
         await msg.edit_text(f"❌ Could not read the correction: {exc}")
