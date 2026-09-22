@@ -176,7 +176,11 @@ The printed layout, so you know where to look:
 - PRICE QUOTED (ALL IN, taxes in): two lines, OURS and LOCAL. Each has five
   boxes for whole dollars, filled from the RIGHT, and a tick box "with
   installation". A leading empty box means the number is shorter, not that a
-  digit is missing: boxes reading _ 1 7 7 6 are 1776, not 17760.
+  digit is missing: boxes reading _ 1 7 7 6 are 1776, not 17760. Read these
+  boxes one at a time, the way you read the phone. An empty box is nothing at
+  all - it is never a zero. 22 September: boxes _ 2 2 4 6 came back as 22046,
+  because the empty box was written down as a 0. The price the rep wrote was
+  2246.
 - BOOKED: one tick box. Ticked means the customer is booked for installation.
 - HEARD OF US: five tick boxes - Google, Castanet, Facebook, referral,
   been here before.
@@ -188,6 +192,11 @@ STEP 1 - evidence. Before deciding anything, write down what you actually see:
   "phone_boxes": one entry per box, left to right, ten of them. Each entry is
     the single digit written in that box, or null if the box is empty. Do not
     write the number as a whole - go box by box, and count the boxes as you go.
+
+  "price_ours_boxes" and "price_local_boxes": five entries each, left to
+    right, one entry per box. Each entry is the digit written in that box, or
+    null if the box is empty. An empty box is null, NEVER "0". Do not write
+    the price as a whole number and do not pad it to five digits.
 
   "ticked": the list of tick boxes that have ink in them. Use these names and
     no others: in_stock, out_of_stock, local_offer, ours_with_installation,
@@ -207,8 +216,8 @@ Return ONLY valid JSON, no markdown fence, no commentary:
   "company": "the business, as written, or null",
   "vehicle": "as written, or null",
   "size": "as written with its separators, e.g. 275/60R20, or null",
-  "price_ours": whole number or null,
-  "price_local": whole number or null,
+  "price_ours_boxes": [null,"2","2","4","6"],
+  "price_local_boxes": [null,null,null,null,null],
   "unreadable": ["fields you could not READ. A blank box is not\n                  unreadable - a blank box is simply an answer of no."]
 }
 
@@ -220,6 +229,14 @@ call card that was just read from a photograph. Return ONLY the fields the rep
 is correcting, as valid JSON using these exact keys where they apply: phone,
 name, company, vehicle, size, stock_in, stock_out, stock_local, price_ours,
 price_ours_install, price_local, price_local_install, booked, heard.
+
+A price is a whole number of dollars, digits only - no dollar sign, no
+comma, no cents. "$2 246" is 2246.
+
+If the rep gives a value but does not say which field it belongs to, do NOT
+guess which one he means. Return {"ambiguous": "<what he typed>"} and nothing
+else. 22 September: a corrected price with no field named was filed as the
+shop's own price when the rep was fixing the local one.
 
 Return an empty object {} if nothing in the message is a field correction.
 Do not invent fields the rep did not mention.
@@ -260,6 +277,33 @@ def clean_size(value):
     return None, True
 
 
+def clean_money(value):
+    """A price is a whole number of dollars. Anything else is not a price.
+
+    22 September: the rep corrected a price by typing "$2246". It went into
+    Kommo as the string "$2246", printed as "$$2246", and would have stopped
+    the lead dead at int(price). Money arrives from a photograph and from a
+    typed correction; both come through here.
+    """
+    if value is None:
+        return None
+    d = re.sub(r'\D', '', str(value))
+    return int(d) if d else None
+
+
+def money_from_boxes(boxes, fallback):
+    """Five boxes, one digit each, empty ones simply absent.
+
+    This is the phone-number fix applied to the price. The model is asked what
+    is IN each box and nothing else, so an empty box cannot quietly become a 0
+    the way it did on 22 September (_ 2 2 4 6 -> 22046).
+    """
+    if isinstance(boxes, list):
+        d = ''.join(re.sub(r'\D', '', str(b or '')) for b in boxes)
+        return int(d) if d else None
+    return clean_money(fallback)
+
+
 def normalise_card(raw: dict) -> dict:
     """Turn the model's evidence into the flat card the rest of the code uses.
 
@@ -297,9 +341,11 @@ def normalise_card(raw: dict) -> dict:
         'stock_in': 'in_stock' in ticked,
         'stock_out': 'out_of_stock' in ticked,
         'stock_local': 'local_offer' in ticked,
-        'price_ours': raw.get('price_ours'),
+        'price_ours': money_from_boxes(raw.get('price_ours_boxes'),
+                                       raw.get('price_ours')),
         'price_ours_install': 'ours_with_installation' in ticked,
-        'price_local': raw.get('price_local'),
+        'price_local': money_from_boxes(raw.get('price_local_boxes'),
+                                        raw.get('price_local')),
         'price_local_install': 'local_with_installation' in ticked,
         'booked': 'booked' in ticked,
         'heard': heard,
@@ -937,7 +983,7 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
     phone = data.get('phone')
     contact_id, contact_name = find_contact_by_phone(phone) if phone else (None, None)
 
-    price = data.get('price_ours') or None
+    price = clean_money(data.get('price_ours'))
     fields = lead_fields(data, store)
     stage = pick_stage(data)
 
@@ -1332,6 +1378,14 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Applying the correction…")
     try:
         patch = read_correction(update.message.text)
+        if patch.get('ambiguous'):
+            await msg.edit_text(
+                "Which line is that? Name the field and send it again \u2014 "
+                "\"our price 2246\", \"local price 2246\", \"phone 250 571 4654\".")
+            return
+        for key in ('price_ours', 'price_local'):
+            if key in patch:
+                patch[key] = clean_money(patch[key])
         data = dict(context.user_data['pending'])
         data.update({k: v for k, v in patch.items() if v is not None})
         context.user_data['pending'] = data
