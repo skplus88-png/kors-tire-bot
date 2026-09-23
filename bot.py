@@ -442,10 +442,10 @@ def read_card(image_data: bytes, media_type: str = 'image/jpeg') -> dict:
     response = claude.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=8000,
-        # A card is a fact, not an opinion, so the same photograph must read
-        # the same way every time. Left at the default, the model answered
-        # the same card two different ways on 22 September.
-        temperature=0,
+        # No temperature here. 23 September: temperature=0 was added to stop
+        # the same card reading two different ways, and this model rejects the
+        # parameter outright - every card came back "400 `temperature` is
+        # deprecated for this model". Consistency has to come from the prompt.
         messages=[{
             "role": "user",
             "content": [
