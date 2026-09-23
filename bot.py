@@ -93,12 +93,20 @@ DROPBOX_REFRESH_TOKEN = os.environ.get('DROPBOX_REFRESH_TOKEN')
 # All of these were read off GET /api/v4/*/custom_fields on 29 August 2026.
 # None of them are remembered or assumed.
 
-PIPELINE_ID = 11129295
+# 22 September 2026: call cards move to their own pipeline, "Lead Sheets".
+# Daniel's reason: a card is a different kind of lead from a web enquiry, and
+# mixing the two made the main pipeline unreadable. Read off the live pipeline
+# in Kommo on 22 September, not remembered.
+PIPELINE_ID = 14502019        # Lead Sheets
 
-STAGE_NEW = 85390759          # New Lead
-STAGE_IN_CONTACT = 110074519  # In Contact
-STAGE_QUOTE_SENT = 85390763   # Quote Sent
-STAGE_BOOKED = 85390771       # Booked for Install
+STAGE_NEW = 112014951         # New Lead
+STAGE_IN_CONTACT = 112014955  # Contacted
+STAGE_QUOTE_SENT = 112014959  # Quote Sent
+STAGE_BOOKED = 112016951      # Booked
+
+# The old main pipeline, kept because a customer who called before still has
+# his open lead there. 11129295, stages 85390759 / 110074519 / 85390763 /
+# 85390771.
 CLOSED_WON = 142
 CLOSED_LOST = 143
 
@@ -380,7 +388,28 @@ def parse_claude_json(response) -> dict:
     return json.loads(raw)
 
 
-def read_card(image_data: bytes) -> dict:
+IMAGE_SIGNATURES = ((b'\xff\xd8\xff', 'image/jpeg'),
+                    (b'\x89PNG\r\n\x1a\n', 'image/png'),
+                    (b'GIF87a', 'image/gif'),
+                    (b'GIF89a', 'image/gif'))
+
+
+def image_media_type(data: bytes) -> str:
+    """What this file actually is, read from its first bytes.
+
+    A card sent as a FILE instead of a photo keeps its original format, and
+    Telegram does not convert it. Saying "image/jpeg" about a PNG is how a
+    perfectly good card comes back as an error nobody can explain.
+    """
+    for sig, kind in IMAGE_SIGNATURES:
+        if data.startswith(sig):
+            return kind
+    if data[:4] == b'RIFF' and data[8:12] == b'WEBP':
+        return 'image/webp'
+    return ''
+
+
+def read_card(image_data: bytes, media_type: str = 'image/jpeg') -> dict:
     b64 = base64.standard_b64encode(image_data).decode('utf-8')
     response = claude.messages.create(
         model=CLAUDE_MODEL,
@@ -390,7 +419,7 @@ def read_card(image_data: bytes) -> dict:
             "content": [
                 {"type": "image",
                  "source": {"type": "base64",
-                            "media_type": "image/jpeg", "data": b64}},
+                            "media_type": media_type, "data": b64}},
                 {"type": "text", "text": CARD_PROMPT},
             ],
         }],
@@ -612,9 +641,9 @@ def confirmation_text(data: dict, store: str, call_check=None,
 
 def stage_name(data: dict) -> str:
     sid = pick_stage(data)
-    return {STAGE_BOOKED: "Booked for Install",
+    return {STAGE_BOOKED: "Booked",
             STAGE_QUOTE_SENT: "Quote Sent",
-            STAGE_IN_CONTACT: "In Contact"}.get(sid, "New Lead")
+            STAGE_IN_CONTACT: "Contacted"}.get(sid, "New Lead")
 
 
 def pick_stage(data: dict) -> int:
@@ -1228,14 +1257,50 @@ async def notify_admin(context, update, error_text: str):
         log.error("Admin notify failed: %s", exc, exc_info=True)
 
 
+async def log_incoming(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One line per message, whoever sent it.
+
+    Runs before every other handler and stops nothing. It exists because
+    "nothing happens" is impossible to diagnose without knowing whether the
+    message reached the bot at all.
+    """
+    m = update.effective_message
+    u = update.effective_user
+    if not m:
+        return
+    kind = ('photo' if m.photo else
+            f"file {m.document.mime_type}" if m.document else
+            'text' if m.text else 'other')
+    log.info("IN %s from %s id=%s store=%s", kind, who_for(update),
+             u.id if u else '?', store_for(update) or 'NOT SET')
+
+
+async def handle_other(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Anything that is not a card, a correction or a command.
+
+    Silence teaches a rep that the bot is broken. A sentence teaches him what
+    to send.
+    """
+    await update.message.reply_text(
+        "I read photographs of call cards. Send the card as a photo, or as an "
+        "image file, and I will read it.")
+
+
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text("⏳ Reading the card…")
     store = store_for(update)
     when = datetime.datetime.now(LOCAL_TZ)
 
     try:
-        photo = update.message.photo[-1]
-        f = await context.bot.get_file(photo.file_id)
+        # A photo compressed by Telegram, or the same card sent as a file.
+        # 22 September: Leslie sent cards and nothing happened at all - the
+        # bot listened for photos only, and a file is a different kind of
+        # message, so her cards never reached any handler.
+        if update.message.photo:
+            file_id = update.message.photo[-1].file_id
+        else:
+            file_id = update.message.document.file_id
+        f = await context.bot.get_file(file_id)
         buf = io.BytesIO()
         await f.download_to_memory(buf)
         image = buf.getvalue()
@@ -1246,9 +1311,18 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
                            f"Telegram photo download failed.\n{type(exc).__name__}: {exc}")
         return
 
+    media_type = image_media_type(image)
+    if not media_type:
+        log.error("Unreadable image format, %d bytes, starts %r",
+                  len(image), image[:12])
+        await msg.edit_text(
+            "\u274c I cannot read that file. If your phone sends photos as "
+            "HEIC, send the card as a photo rather than as a file.")
+        return
+
     data, read_error = None, None
     try:
-        data = read_card(image)
+        data = read_card(image, media_type)
     except Exception as exc:
         read_error = exc
         log.error("Card read failed: %s", exc, exc_info=True)
@@ -1461,8 +1535,11 @@ def main():
     app.add_handler(CommandHandler("id", whoami))
     app.add_handler(CommandHandler("health", health))
     app.add_handler(CallbackQueryHandler(on_button))
-    app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    app.add_handler(MessageHandler(filters.ALL, log_incoming), group=-1)
+    app.add_handler(MessageHandler(filters.PHOTO | filters.Document.IMAGE,
+                                   handle_photo))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
+    app.add_handler(MessageHandler(~filters.COMMAND, handle_other))
     log.info("Card bot up. Model %s | admin alerts %s | stores %d",
              CLAUDE_MODEL, "ON" if ADMIN_CHAT_ID else "OFF", len(STORE_BY_USER))
     app.run_polling(drop_pending_updates=True)
