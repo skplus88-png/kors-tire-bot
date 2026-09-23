@@ -206,12 +206,21 @@ STEP 1 - evidence. Before deciding anything, write down what you actually see:
     null if the box is empty. An empty box is null, NEVER "0". Do not write
     the price as a whole number and do not pad it to five digits.
 
-  "ticked": the list of tick boxes that have ink in them. Use these names and
-    no others: in_stock, out_of_stock, local_offer, ours_with_installation,
-    local_with_installation, booked, google, castanet, facebook, referral,
-    been_here_before. A box goes in this list ONLY if you can see a pen stroke
-    inside the square. If the list is empty, return []. Do not add a box
-    because the card would "make sense" with it ticked.
+  "boxes": every tick box on the card, answered one at a time. The eleven
+    names, and no others: in_stock, out_of_stock, local_offer,
+    ours_with_installation, local_with_installation, booked, google,
+    castanet, facebook, referral, been_here_before. For each one answer
+    exactly "ink", "empty" or "unsure":
+      "ink"    - there is a visible pen stroke inside the square;
+      "empty"  - the square is printed and bare;
+      "unsure" - you cannot tell, because of a fold, a shadow, glare or the
+                 photograph being cut off.
+    Answer for all eleven, in this order, and leave none out. Do not answer
+    "ink" because the card would "make sense" with that box ticked, and do
+    not answer "empty" for a square you did not actually look at. 22
+    September: the same card read twice gave "with installation" as ticked
+    once and not the other time - that box was simply skipped, and a list of
+    ticked boxes hides a skip, while an answer per box does not.
 
 STEP 2 - the rest.
 
@@ -219,7 +228,11 @@ Return ONLY valid JSON, no markdown fence, no commentary:
 
 {
   "phone_boxes": ["2","5","0","5","7","1","4","6","5","4"],
-  "ticked": ["out_of_stock", "local_offer", "booked", "facebook"],
+  "boxes": {"in_stock": "empty", "out_of_stock": "ink",
+            "local_offer": "ink", "ours_with_installation": "empty",
+            "local_with_installation": "ink", "booked": "unsure",
+            "google": "empty", "castanet": "empty", "facebook": "ink",
+            "referral": "empty", "been_here_before": "empty"},
   "name": "the person, as written, or null",
   "company": "the business, as written, or null",
   "vehicle": "as written, or null",
@@ -321,7 +334,20 @@ def normalise_card(raw: dict) -> dict:
     card where both squares were bare. Listing what has ink is a smaller thing
     to get wrong than filling in eleven true/false answers.
     """
-    ticked = {t for t in (raw.get('ticked') or []) if t in TICK_NAMES}
+    boxes_said = raw.get('boxes')
+    unsure_boxes = []
+    if isinstance(boxes_said, dict):
+        ticked = set()
+        for name in TICK_NAMES:
+            answer = str(boxes_said.get(name, 'unsure')).strip().lower()
+            if answer == 'ink':
+                ticked.add(name)
+            elif answer != 'empty':
+                # Not seen is not the same as not ticked. It goes to the rep.
+                unsure_boxes.append(name.replace('_', ' '))
+    else:
+        # An older answer shape, kept so a card is never lost over a format.
+        ticked = {t for t in (raw.get('ticked') or []) if t in TICK_NAMES}
 
     boxes = raw.get('phone_boxes')
     if isinstance(boxes, list):
@@ -337,6 +363,8 @@ def normalise_card(raw: dict) -> dict:
 
     size, size_bad = clean_size(raw.get('size'))
     unreadable = list(raw.get('unreadable') or [])
+    if unsure_boxes:
+        unreadable.append("tick boxes: " + ", ".join(unsure_boxes))
     if size_bad:
         unreadable.append('size (impossible shape - check the boxes)')
 
@@ -414,6 +442,10 @@ def read_card(image_data: bytes, media_type: str = 'image/jpeg') -> dict:
     response = claude.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=8000,
+        # A card is a fact, not an opinion, so the same photograph must read
+        # the same way every time. Left at the default, the model answered
+        # the same card two different ways on 22 September.
+        temperature=0,
         messages=[{
             "role": "user",
             "content": [
