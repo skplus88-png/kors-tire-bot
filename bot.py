@@ -100,7 +100,7 @@ DROPBOX_REFRESH_TOKEN = os.environ.get('DROPBOX_REFRESH_TOKEN')
 PIPELINE_ID = 14502019        # Lead Sheets
 
 STAGE_NEW = 112014951         # New Lead
-STAGE_IN_CONTACT = 112123795  # Contacted
+STAGE_IN_CONTACT = 112123795  # New Lead
 STAGE_QUOTE_SENT = 112014959  # Quote Sent
 STAGE_BOOKED = 112016951      # Booked
 
@@ -675,7 +675,7 @@ def stage_name(data: dict) -> str:
     sid = pick_stage(data)
     return {STAGE_BOOKED: "Booked",
             STAGE_QUOTE_SENT: "Quote Sent",
-            STAGE_IN_CONTACT: "Contacted"}.get(sid, "New Lead")
+            STAGE_IN_CONTACT: "New Lead"}.get(sid, "New Lead")
 
 
 def pick_stage(data: dict) -> int:
