@@ -99,10 +99,18 @@ DROPBOX_REFRESH_TOKEN = os.environ.get('DROPBOX_REFRESH_TOKEN')
 # in Kommo on 22 September, not remembered.
 PIPELINE_ID = 14502019        # Lead Sheets
 
-STAGE_NEW = 112014951         # New Lead
-STAGE_IN_CONTACT = 112123795  # New Lead
-STAGE_QUOTE_SENT = 112014959  # Quote Sent
-STAGE_BOOKED = 112016951      # Booked
+# Stages are looked up in Kommo BY NAME, not written here as numbers.
+# 23 September 2026 two stages of Lead Sheets were deleted and recreated with
+# new numbers; the bot kept sending the dead number and Kommo refused every
+# card without a price for two days. A name survives that; a number does not.
+# The bot asks Kommo for the pipeline, finds the stage whose name matches, and
+# asks again whenever Kommo refuses a stage.
+STAGE_NAMES = {
+    "booked": ("booked", "booked for install"),
+    "quote":  ("quote sent",),
+    "new":    ("new lead",),
+}
+STAGE_CACHE_SECONDS = 600
 
 # The old main pipeline, kept because a customer who called before still has
 # his open lead there. 11129295, stages 85390759 / 110074519 / 85390763 /
@@ -671,24 +679,75 @@ def confirmation_text(data: dict, store: str, call_check=None,
     return "\n".join(lines)
 
 
-def stage_name(data: dict) -> str:
-    sid = pick_stage(data)
-    return {STAGE_BOOKED: "Booked",
-            STAGE_QUOTE_SENT: "Quote Sent",
-            STAGE_IN_CONTACT: "New Lead"}.get(sid, "New Lead")
+_STAGES = {'ids': None, 'names': {}, 'at': datetime.datetime.min}
 
 
-def pick_stage(data: dict) -> int:
+def stage_ids(refresh: bool = False) -> dict:
+    """{"booked": id, "quote": id, "new": id}, read live from Kommo.
+
+    Each role is found by the stage NAME in the Lead Sheets pipeline. A role
+    whose name is missing falls back to the first open stage after Incoming
+    leads, so a renamed stage costs a wrong column, never a lost card.
+    """
+    now = datetime.datetime.utcnow()
+    fresh = (now - _STAGES['at']).total_seconds() < STAGE_CACHE_SECONDS
+    if _STAGES['ids'] and fresh and not refresh:
+        return _STAGES['ids']
+    data = kommo_get(f'/leads/pipelines/{PIPELINE_ID}')
+    statuses = sorted(data.get('_embedded', {}).get('statuses', []),
+                      key=lambda st: st.get('sort', 0))
+    open_ones = [st for st in statuses
+                 if st.get('id') not in (CLOSED_WON, CLOSED_LOST)
+                 and st.get('type', 0) != 1]          # type 1 = Incoming leads
+    if not open_ones:
+        raise RuntimeError(f"Pipeline {PIPELINE_ID} has no open stages")
+    by_name = {(st.get('name') or '').strip().lower(): st['id']
+               for st in open_ones}
+    ids, names = {}, {}
+    for role, wanted in STAGE_NAMES.items():
+        sid = next((by_name[n] for n in wanted if n in by_name), None)
+        if sid is None:
+            sid = open_ones[0]['id']
+            log.warning("Stage for %r (%s) not found in pipeline %s - "
+                        "using %s", role, "/".join(wanted), PIPELINE_ID, sid)
+        ids[role] = sid
+    for st in open_ones:
+        names[st['id']] = st.get('name')
+    _STAGES.update(ids=ids, names=names, at=now)
+    log.info("Stages read from Kommo: %s", ids)
+    return ids
+
+
+def stage_role(data: dict) -> str:
     """Stage = the last action actually completed. Nothing more is claimed.
 
     Booked ticked -> he is booked. A price written -> we quoted him. Neither ->
-    we spoke to him, which is already more than New Lead means.
+    New Lead.
     """
     if data.get('booked'):
-        return STAGE_BOOKED
+        return "booked"
     if data.get('price_ours') or data.get('price_local'):
-        return STAGE_QUOTE_SENT
-    return STAGE_IN_CONTACT
+        return "quote"
+    return "new"
+
+
+def pick_stage(data: dict, refresh: bool = False) -> int:
+    return stage_ids(refresh)[stage_role(data)]
+
+
+def stage_name(data: dict) -> str:
+    try:
+        sid = pick_stage(data)
+        return _STAGES['names'].get(sid) or "New Lead"
+    except Exception as exc:
+        log.error("Stage lookup failed: %s", exc)
+        return {"booked": "Booked", "quote": "Quote Sent"}.get(
+            stage_role(data), "New Lead")
+
+
+def stage_refused(r) -> bool:
+    """Kommo said no to the stage number itself."""
+    return r.status_code == 400 and 'status_id' in (r.text or '')
 
 
 # ----------------------------------------------------------------- Kommo calls
@@ -1046,7 +1105,11 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
 
     price = clean_money(data.get('price_ours'))
     fields = lead_fields(data, store)
-    stage = pick_stage(data)
+    try:
+        stage = pick_stage(data)
+    except Exception as exc:
+        return (False, f"Could not read the Lead Sheets stages from Kommo: {exc}",
+                None, None, False, undo)
 
     existing = open_lead_for_contact(contact_id) if contact_id else None
 
@@ -1064,6 +1127,13 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
         r = requests.patch(f"{KOMMO_BASE}/leads/{lead_id}",
                            headers=HEADERS, json=body, timeout=30)
         log.info("PATCH lead %s -> %s %s", lead_id, r.status_code, r.text[:900])
+        if stage_refused(r):
+            # The stage changed under us. Read the pipeline again, once.
+            body["status_id"] = pick_stage(data, refresh=True)
+            r = requests.patch(f"{KOMMO_BASE}/leads/{lead_id}",
+                               headers=HEADERS, json=body, timeout=30)
+            log.info("PATCH lead %s retry -> %s %s", lead_id, r.status_code,
+                     r.text[:900])
         if r.status_code not in (200, 201):
             return False, f"Kommo {r.status_code}: {r.text[:200]}", None, None, True, undo
         was_existing = True
@@ -1080,8 +1150,7 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
             lead["_embedded"] = {"contacts": [{"id": contact_id}]}
             log.info("CREATE lead on contact %s body=%s", contact_id,
                      json.dumps(lead)[:900])
-            r = requests.post(f"{KOMMO_BASE}/leads", headers=HEADERS,
-                              json=[lead], timeout=30)
+            url = f"{KOMMO_BASE}/leads"
         else:
             contact = {"name": data.get('name') or 'Unknown'}
             if phone:
@@ -1089,8 +1158,15 @@ def save_to_kommo(data: dict, store: str, who: str) -> tuple:
                     "field_id": F_CONTACT_PHONE,
                     "values": [{"value": digits(phone), "enum_code": "WORK"}]}]
             lead["_embedded"] = {"contacts": [contact]}
-            r = requests.post(f"{KOMMO_BASE}/leads/complex", headers=HEADERS,
-                              json=[lead], timeout=30)
+            log.info("CREATE lead with new contact body=%s",
+                     json.dumps(lead)[:900])
+            url = f"{KOMMO_BASE}/leads/complex"
+        r = requests.post(url, headers=HEADERS, json=[lead], timeout=30)
+        if stage_refused(r):
+            # The stage changed under us. Read the pipeline again, once.
+            log.info("CREATE lead -> %s %s", r.status_code, r.text[:900])
+            lead["status_id"] = pick_stage(data, refresh=True)
+            r = requests.post(url, headers=HEADERS, json=[lead], timeout=30)
 
         log.info("CREATE lead -> %s %s", r.status_code, r.text[:900])
         if r.status_code not in (200, 201):
